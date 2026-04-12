@@ -217,12 +217,15 @@ async function toggleDetail(row) {
 
     if (detailRow.classList.contains("open")) {
         detailRow.classList.remove("open");
+        row.classList.remove("expanded");
         if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
         return;
     }
     document.querySelectorAll(".detail.open").forEach(el => el.classList.remove("open"));
+    document.querySelectorAll(".clickable.expanded").forEach(el => el.classList.remove("expanded"));
     if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
     detailRow.classList.add("open");
+    row.classList.add("expanded");
 
     try {
         const d = await api("/api/post/timeline?uri=" + encodeURIComponent(uri));
@@ -244,12 +247,15 @@ async function toggleCardDetail(card) {
 
     if (detail.classList.contains("open")) {
         detail.classList.remove("open");
+        card.classList.remove("expanded");
         if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
         return;
     }
     document.querySelectorAll(".card-detail.open").forEach(el => el.classList.remove("open"));
+    document.querySelectorAll(".post-card.expanded").forEach(el => el.classList.remove("expanded"));
     if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
     detail.classList.add("open");
+    card.classList.add("expanded");
 
     try {
         const d = await api("/api/post/timeline?uri=" + encodeURIComponent(uri));

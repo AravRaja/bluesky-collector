@@ -1,0 +1,14 @@
+[Unit]
+Description=Bluesky Jetstream Collector
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bluesky-collector
+ExecStart=/home/ubuntu/bluesky-collector/.venv/bin/python collect.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

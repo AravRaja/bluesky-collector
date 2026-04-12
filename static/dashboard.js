@@ -1,259 +1,211 @@
-// Dashboard auto-refresh logic
+// Minimal dashboard — OLED dark, white accents
 
 function fmt(n) {
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
     if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
     return String(n);
 }
-
-function timeAgo(timeUs) {
-    const sec = (Date.now() * 1000 - timeUs) / 1e6;
-    if (sec < 60) return Math.round(sec) + "s";
-    if (sec < 3600) return Math.round(sec / 60) + "m";
-    if (sec < 86400) return Math.round(sec / 3600) + "h";
-    return Math.round(sec / 86400) + "d";
+function timeAgo(us) {
+    const s = (Date.now() * 1000 - us) / 1e6;
+    if (s < 60) return Math.round(s) + "s";
+    if (s < 3600) return Math.round(s / 60) + "m";
+    if (s < 86400) return Math.round(s / 3600) + "h";
+    return Math.round(s / 86400) + "d";
 }
-
-function escHtml(s) {
-    const d = document.createElement("div");
-    d.textContent = s || "";
-    return d.innerHTML;
-}
-
-function embedBadge(d) {
+function esc(s) { const d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
+function badge(d) {
     if (!d.has_embed) return "";
     const t = (d.embed_type || "").replace("app.bsky.embed.", "");
-    const cls = {
-        images: "embed-images",
-        video: "embed-video",
-        external: "embed-external",
-        record: "embed-record",
-        recordWithMedia: "embed-recordWithMedia",
-    }[t] || "embed-other";
-    return `<span class="embed-badge ${cls}">${t || "embed"}</span>`;
+    return `<span class="badge">${t || "embed"}</span>`;
 }
 
-// ── Charts setup ──
-const chartDefaults = {
-    responsive: true,
-    maintainAspectRatio: false,
+// Chart defaults
+const chartOpts = {
+    responsive: true, maintainAspectRatio: false,
     interaction: { mode: "index", intersect: false },
     scales: {
-        x: {
-            ticks: { color: "#64748b", font: { family: "'Fira Code', monospace", size: 10 }, maxTicksLimit: 8 },
-            grid: { color: "rgba(30,41,59,0.5)" },
-            border: { color: "#1e293b" },
-        },
-        y: {
-            ticks: { color: "#64748b", font: { family: "'Fira Code', monospace", size: 10 } },
-            grid: { color: "rgba(30,41,59,0.5)" },
-            border: { color: "#1e293b" },
-        },
+        x: { ticks: { color: "#555", font: { family: "'JetBrains Mono'", size: 9 }, maxTicksLimit: 8 }, grid: { color: "#1a1a1a" }, border: { color: "#1a1a1a" } },
+        y: { ticks: { color: "#555", font: { family: "'JetBrains Mono'", size: 9 } }, grid: { color: "#1a1a1a" }, border: { color: "#1a1a1a" } },
     },
     plugins: {
-        legend: {
-            labels: {
-                color: "#94a3b8",
-                font: { family: "'Fira Sans', sans-serif", size: 11 },
-                boxWidth: 10, boxHeight: 10,
-                useBorderRadius: true, borderRadius: 2, padding: 16,
-            },
-        },
-        tooltip: {
-            backgroundColor: "#111827", borderColor: "#1e293b", borderWidth: 1,
-            titleFont: { family: "'Fira Code', monospace", size: 11 },
-            bodyFont: { family: "'Fira Sans', sans-serif", size: 12 },
-            padding: 10, cornerRadius: 8,
-        },
+        legend: { labels: { color: "#555", font: { family: "'Inter'", size: 10 }, boxWidth: 8, boxHeight: 8, padding: 12 } },
+        tooltip: { backgroundColor: "#111", borderColor: "#333", borderWidth: 1, titleFont: { family: "'JetBrains Mono'", size: 10 }, bodyFont: { family: "'Inter'", size: 11 }, padding: 8, cornerRadius: 4 },
     },
 };
 
-// Event rate chart
-const rateChart = new Chart(document.getElementById("rateChart").getContext("2d"), {
+// Rate chart
+const rateChart = new Chart(document.getElementById("rateChart"), {
     type: "line",
-    data: {
-        labels: [],
-        datasets: [
-            { label: "Posts",   data: [], borderColor: "#3b82f6", borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
-            { label: "Likes",   data: [], borderColor: "#22c55e", borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
-            { label: "Reposts", data: [], borderColor: "#ec4899", borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
-            { label: "Follows", data: [], borderColor: "#f59e0b", borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
-        ],
-    },
-    options: chartDefaults,
+    data: { labels: [], datasets: [
+        { label: "Posts", data: [], borderColor: "#fff", borderWidth: 1, pointRadius: 0, tension: 0.3 },
+        { label: "Likes", data: [], borderColor: "#666", borderWidth: 1, pointRadius: 0, tension: 0.3 },
+        { label: "Reposts", data: [], borderColor: "#444", borderWidth: 1, pointRadius: 0, tension: 0.3 },
+    ] },
+    options: chartOpts,
 });
 
-// Hourly throughput chart
-const throughputChart = new Chart(document.getElementById("throughputChart").getContext("2d"), {
+// Throughput chart
+const tpChart = new Chart(document.getElementById("throughputChart"), {
     type: "bar",
-    data: {
-        labels: [],
-        datasets: [
-            { label: "Posts",   data: [], backgroundColor: "rgba(59,130,246,0.6)", borderRadius: 3 },
-            { label: "Likes",   data: [], backgroundColor: "rgba(34,197,94,0.6)", borderRadius: 3 },
-            { label: "Reposts", data: [], backgroundColor: "rgba(236,72,153,0.6)", borderRadius: 3 },
-        ],
-    },
-    options: {
-        ...chartDefaults,
-        plugins: {
-            ...chartDefaults.plugins,
-            legend: { display: false },
-        },
-        scales: {
-            ...chartDefaults.scales,
-            x: { ...chartDefaults.scales.x, stacked: true },
-            y: { ...chartDefaults.scales.y, stacked: true },
-        },
-    },
+    data: { labels: [], datasets: [
+        { label: "Posts", data: [], backgroundColor: "#fff", borderRadius: 2 },
+        { label: "Likes", data: [], backgroundColor: "#444", borderRadius: 2 },
+    ] },
+    options: { ...chartOpts, plugins: { ...chartOpts.plugins, legend: { display: false } }, scales: { ...chartOpts.scales, x: { ...chartOpts.scales.x, stacked: true }, y: { ...chartOpts.scales.y, stacked: true } } },
 });
 
-// ── API fetcher ──
-async function fetchJSON(url) {
-    const r = await fetch(url);
-    return r.json();
-}
+async function api(url) { return (await fetch(url)).json(); }
 
-// ── Refresh functions ──
+// Active detail charts (cleanup on close)
+let activeDetailChart = null;
+
 async function refreshStatus() {
     try {
-        const d = await fetchJSON("/api/status");
-        document.getElementById("s-posts").textContent = fmt(d.counts.posts);
+        const d = await api("/api/status");
         document.getElementById("s-likes").textContent = fmt(d.counts.likes);
         document.getElementById("s-reposts").textContent = fmt(d.counts.reposts);
-        document.getElementById("s-follows").textContent = fmt(d.counts.follows);
-        document.getElementById("s-rate").textContent = d.events_per_sec;
-    } catch (e) { /* ignore */ }
-}
-
-async function refreshRate() {
-    try {
-        const data = await fetchJSON("/api/rate?hours=6");
-        rateChart.data.labels = data.map(d => d.ts.slice(11, 16));
-        rateChart.data.datasets[0].data = data.map(d => d.posts);
-        rateChart.data.datasets[1].data = data.map(d => d.likes);
-        rateChart.data.datasets[2].data = data.map(d => d.reposts);
-        rateChart.data.datasets[3].data = data.map(d => d.follows);
-        rateChart.update("none");
-    } catch (e) { /* ignore */ }
-}
-
-async function refreshTop() {
-    try {
-        const data = await fetchJSON("/api/top?n=20&window=60");
-        const tbody = document.getElementById("top-body");
-        if (!data.length) {
-            tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No posts in the last 60 minutes</td></tr>';
-            return;
-        }
-        tbody.innerHTML = data.map(d =>
-            `<tr>` +
-            `<td class="text-col">${escHtml(d.text)}</td>` +
-            `<td>${embedBadge(d)}</td>` +
-            `<td class="num-col">${d.likes}</td>` +
-            `<td class="num-col">${d.reposts}</td>` +
-            `</tr>`
-        ).join("");
-    } catch (e) { /* ignore */ }
-}
-
-async function refreshViral() {
-    try {
-        const d = await fetchJSON("/api/viral?threshold=100");
-        document.getElementById("viral-pct").textContent = d.pct + "%";
-        document.getElementById("viral-detail").textContent =
-            `${fmt(d.viral)} with 100+ reposts / ${fmt(d.total)} root posts`;
-    } catch (e) { /* ignore */ }
-}
-
-async function refreshRecent() {
-    try {
-        const data = await fetchJSON("/api/recent?n=50");
-        const tbody = document.getElementById("recent-body");
-        if (!data.length) {
-            tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No posts yet</td></tr>';
-            return;
-        }
-        tbody.innerHTML = data.map(d =>
-            `<tr>` +
-            `<td class="text-col">${escHtml(d.text)}</td>` +
-            `<td>${embedBadge(d)}</td>` +
-            `<td class="num-col">${d.likes}</td>` +
-            `<td class="num-col">${d.reposts}</td>` +
-            `<td class="time-col">${timeAgo(d.time_us)}</td>` +
-            `</tr>`
-        ).join("");
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
 }
 
 async function refreshHealth() {
     try {
-        const d = await fetchJSON("/api/health");
+        const d = await api("/api/health");
+        document.getElementById("s-roots").textContent = fmt(d.totals.root_posts);
+        document.getElementById("s-db").textContent = d.db_size_mb + "MB";
 
-        // Summary stats
-        document.getElementById("h-since").textContent = d.collection_started || "not started";
-        document.getElementById("h-dbsize").textContent = d.db_size_mb + " MB";
-        document.getElementById("h-roots").textContent = fmt(d.totals.root_posts);
-        document.getElementById("h-authors").textContent = fmt(d.totals.unique_authors);
-
-        const pctLikes = d.engagement_coverage.pct_with_likes;
-        const pctReposts = d.engagement_coverage.pct_with_reposts;
-        const elLikes = document.getElementById("h-pct-likes");
-        const elReposts = document.getElementById("h-pct-reposts");
-        elLikes.textContent = pctLikes + "%";
-        elReposts.textContent = pctReposts + "%";
-        elLikes.className = "health-value " + (pctLikes > 20 ? "good" : pctLikes > 5 ? "warn" : "bad");
-        elReposts.className = "health-value " + (pctReposts > 5 ? "good" : pctReposts > 1 ? "warn" : "bad");
-
-        // Repost tier bars
+        // Tiers
         const tiers = d.repost_tiers;
-        const tierKeys = Object.keys(tiers).map(Number).sort((a, b) => a - b);
-        const maxTier = Math.max(...tierKeys.map(k => tiers[String(k)]), 1);
-        const tierContainer = document.getElementById("tier-bars");
-        tierContainer.innerHTML = tierKeys.map(k => {
-            const count = tiers[String(k)];
-            const pct = Math.max((count / maxTier) * 100, count > 0 ? 2 : 0);
-            const color = k >= 100 ? "#ec4899" : k >= 25 ? "#f59e0b" : "#3b82f6";
-            return `<div class="tier-bar">` +
-                `<span class="tier-label">${k}+</span>` +
-                `<div class="tier-track"><div class="tier-fill" style="width:${pct}%;background:${color}"></div></div>` +
-                `<span class="tier-count">${fmt(count)}</span>` +
-                `</div>`;
+        const keys = Object.keys(tiers).map(Number).sort((a, b) => a - b);
+        const max = Math.max(...keys.map(k => tiers[String(k)]), 1);
+        document.getElementById("tier-bars").innerHTML = keys.map(k => {
+            const c = tiers[String(k)];
+            const pct = Math.max((c / max) * 100, c > 0 ? 1 : 0);
+            return `<div class="tier"><span class="tier-label">${k}+</span><div class="tier-track"><div class="tier-fill" style="width:${pct}%"></div></div><span class="tier-count">${fmt(c)}</span></div>`;
         }).join("");
 
-        // All-time most reposted
-        const tbody = document.getElementById("alltime-body");
-        if (d.top_reposted.length) {
-            tbody.innerHTML = d.top_reposted.map(p =>
-                `<tr>` +
-                `<td class="text-col">${escHtml(p.text)}</td>` +
-                `<td class="num-col">${p.reposts}</td>` +
-                `<td class="time-col">${timeAgo(p.time_us)}</td>` +
-                `</tr>`
-            ).join("");
-        }
-
-        // Hourly throughput chart
+        // Throughput
         if (d.hourly_throughput.length) {
-            throughputChart.data.labels = d.hourly_throughput.map(h => h.hour.slice(11, 16));
-            throughputChart.data.datasets[0].data = d.hourly_throughput.map(h => h.posts);
-            throughputChart.data.datasets[1].data = d.hourly_throughput.map(h => h.likes);
-            throughputChart.data.datasets[2].data = d.hourly_throughput.map(h => h.reposts);
-            throughputChart.update("none");
+            tpChart.data.labels = d.hourly_throughput.map(h => h.hour.slice(11, 16));
+            tpChart.data.datasets[0].data = d.hourly_throughput.map(h => h.posts);
+            tpChart.data.datasets[1].data = d.hourly_throughput.map(h => h.likes);
+            tpChart.update("none");
         }
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
 }
 
-// ── Refresh all ──
+async function refreshRate() {
+    try {
+        const data = await api("/api/rate?hours=6");
+        rateChart.data.labels = data.map(d => d.ts.slice(11, 16));
+        rateChart.data.datasets[0].data = data.map(d => d.posts);
+        rateChart.data.datasets[1].data = data.map(d => d.likes);
+        rateChart.data.datasets[2].data = data.map(d => d.reposts);
+        rateChart.update("none");
+    } catch (e) {}
+}
+
+async function refreshViral() {
+    try {
+        const d = await api("/api/viral?threshold=100");
+        document.getElementById("s-viral").textContent = d.viral;
+
+        const posts = await api("/api/viral/posts?n=50");
+        const tbody = document.getElementById("viral-body");
+        if (!posts.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="empty">No posts with 100+ reposts yet</td></tr>';
+            return;
+        }
+        tbody.innerHTML = posts.map((p, i) =>
+            `<tr class="clickable" data-uri="${esc(p.uri)}" data-idx="${i}" onclick="toggleDetail(this)">` +
+            `<td class="text-col">${esc(p.text)}</td>` +
+            `<td>${badge(p)}</td>` +
+            `<td class="mono r">${fmt(p.likes)}</td>` +
+            `<td class="mono r">${fmt(p.reposts)}</td>` +
+            `<td class="mono r muted">${timeAgo(p.time_us)}</td>` +
+            `</tr>` +
+            `<tr class="detail" id="detail-${i}"><td colspan="5"><div class="detail-inner">` +
+            `<div class="detail-stats" id="detail-stats-${i}"></div>` +
+            `<div class="detail-chart"><canvas id="detail-chart-${i}"></canvas></div>` +
+            `<div class="detail-note">Cumulative engagement in the first 30 minutes</div>` +
+            `</div></td></tr>`
+        ).join("");
+    } catch (e) {}
+}
+
+async function toggleDetail(row) {
+    const idx = row.dataset.idx;
+    const uri = row.dataset.uri;
+    const detailRow = document.getElementById("detail-" + idx);
+
+    // Close if open
+    if (detailRow.classList.contains("open")) {
+        detailRow.classList.remove("open");
+        if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
+        return;
+    }
+
+    // Close any other open detail
+    document.querySelectorAll(".detail.open").forEach(el => el.classList.remove("open"));
+    if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
+
+    detailRow.classList.add("open");
+
+    // Fetch timeline
+    try {
+        const d = await api("/api/post/timeline?uri=" + encodeURIComponent(uri));
+        const b = d.buckets;
+        const last = b[b.length - 1];
+
+        // Stats
+        document.getElementById("detail-stats-" + idx).innerHTML =
+            `<div class="detail-stat"><div class="detail-stat-value">${last.likes}</div><div class="detail-stat-label">Likes</div></div>` +
+            `<div class="detail-stat"><div class="detail-stat-value">${last.reposts}</div><div class="detail-stat-label">Reposts</div></div>` +
+            `<div class="detail-stat"><div class="detail-stat-value">${last.replies}</div><div class="detail-stat-label">Replies</div></div>`;
+
+        // Stacked area chart
+        const canvas = document.getElementById("detail-chart-" + idx);
+        activeDetailChart = new Chart(canvas, {
+            type: "line",
+            data: {
+                labels: b.map(x => x.minute + "m"),
+                datasets: [
+                    { label: "Likes", data: b.map(x => x.likes), borderColor: "#fff", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 1, pointRadius: 0, fill: true, tension: 0.3 },
+                    { label: "Reposts", data: b.map(x => x.reposts), borderColor: "#666", backgroundColor: "rgba(102,102,102,0.08)", borderWidth: 1, pointRadius: 0, fill: true, tension: 0.3 },
+                    { label: "Replies", data: b.map(x => x.replies), borderColor: "#333", backgroundColor: "rgba(51,51,51,0.08)", borderWidth: 1, pointRadius: 0, fill: true, tension: 0.3 },
+                ],
+            },
+            options: {
+                ...chartOpts,
+                scales: {
+                    ...chartOpts.scales,
+                    y: { ...chartOpts.scales.y, stacked: true },
+                },
+            },
+        });
+    } catch (e) {
+        document.getElementById("detail-stats-" + idx).innerHTML = '<div class="empty">Failed to load timeline</div>';
+    }
+}
+
+async function refreshRecent() {
+    try {
+        const data = await api("/api/recent?n=30");
+        const tbody = document.getElementById("recent-body");
+        if (!data.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No posts yet</td></tr>'; return; }
+        tbody.innerHTML = data.map(d =>
+            `<tr>` +
+            `<td class="text-col">${esc(d.text)}</td>` +
+            `<td>${badge(d)}</td>` +
+            `<td class="mono r">${d.likes}</td>` +
+            `<td class="mono r">${d.reposts}</td>` +
+            `<td class="mono r muted">${timeAgo(d.time_us)}</td>` +
+            `</tr>`
+        ).join("");
+    } catch (e) {}
+}
+
 async function refreshAll() {
-    await Promise.all([
-        refreshStatus(),
-        refreshRate(),
-        refreshTop(),
-        refreshViral(),
-        refreshRecent(),
-        refreshHealth(),
-    ]);
+    await Promise.all([refreshStatus(), refreshHealth(), refreshRate(), refreshViral(), refreshRecent()]);
 }
 
 refreshAll();

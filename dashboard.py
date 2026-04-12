@@ -321,6 +321,105 @@ def api_recent():
         conn.close()
 
 
+@app.route("/api/post/timeline")
+def api_post_timeline():
+    """Return engagement events bucketed into 1-min intervals for first 30 min."""
+    uri = request.args.get("uri", "")
+    if not uri:
+        return jsonify({"error": "uri required"}), 400
+    conn = get_conn()
+    try:
+        # Get post creation time
+        post = conn.execute(
+            "SELECT time_us FROM posts WHERE uri = ?", (uri,)
+        ).fetchone()
+        if not post:
+            return jsonify({"error": "post not found"}), 404
+        post_time_us = post[0]
+        window_us = 30 * 60 * 1_000_000  # 30 minutes
+
+        # Likes in first 30 min
+        likes = conn.execute(
+            """SELECT time_us FROM engagements
+               WHERE subject_uri = ? AND type = 'like'
+               AND time_us >= ? AND time_us <= ?""",
+            (uri, post_time_us, post_time_us + window_us),
+        ).fetchall()
+
+        # Reposts in first 30 min
+        reposts = conn.execute(
+            """SELECT time_us FROM engagements
+               WHERE subject_uri = ? AND type = 'repost'
+               AND time_us >= ? AND time_us <= ?""",
+            (uri, post_time_us, post_time_us + window_us),
+        ).fetchall()
+
+        # Replies in first 30 min
+        replies = conn.execute(
+            """SELECT time_us FROM posts
+               WHERE (reply_parent = ? OR reply_root = ?)
+               AND time_us >= ? AND time_us <= ?""",
+            (uri, uri, post_time_us, post_time_us + window_us),
+        ).fetchall()
+
+        # Bucket into 1-min intervals (cumulative)
+        buckets = []
+        for minute in range(31):
+            threshold = post_time_us + minute * 60 * 1_000_000
+            buckets.append({
+                "minute": minute,
+                "likes": sum(1 for r in likes if r[0] <= threshold),
+                "reposts": sum(1 for r in reposts if r[0] <= threshold),
+                "replies": sum(1 for r in replies if r[0] <= threshold),
+            })
+
+        return jsonify({"post_time_us": post_time_us, "buckets": buckets})
+    finally:
+        conn.close()
+
+
+@app.route("/api/viral/posts")
+def api_viral_posts():
+    """Return actual viral posts (100+ reposts) with engagement counts."""
+    n = request.args.get("n", 50, type=int)
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT p.uri, p.did, p.text, p.time_us, p.created_at,
+                      p.has_embed, p.embed_type,
+                      COALESCE(l.likes, 0) as likes,
+                      COALESCE(r.reposts, 0) as reposts
+               FROM posts p
+               LEFT JOIN (
+                   SELECT subject_uri, COUNT(*) as likes
+                   FROM engagements WHERE type='like'
+                   GROUP BY subject_uri
+               ) l ON p.uri = l.subject_uri
+               INNER JOIN (
+                   SELECT subject_uri, COUNT(*) as reposts
+                   FROM engagements WHERE type='repost'
+                   GROUP BY subject_uri
+                   HAVING reposts >= 100
+               ) r ON p.uri = r.subject_uri
+               WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
+               ORDER BY r.reposts DESC
+               LIMIT ?""",
+            (n,),
+        ).fetchall()
+        data = [
+            {
+                "uri": r[0], "did": r[1], "text": (r[2] or "")[:200],
+                "time_us": r[3], "created_at": r[4],
+                "has_embed": bool(r[5]), "embed_type": r[6],
+                "likes": r[7], "reposts": r[8],
+            }
+            for r in rows
+        ]
+        return jsonify(data)
+    finally:
+        conn.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bluesky Collector Dashboard")
     parser.add_argument("--port", type=int, default=5000)

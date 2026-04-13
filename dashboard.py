@@ -6,11 +6,118 @@ Usage:
 
 import argparse
 import os
+import threading
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
 import db
+
+# In-memory cache for expensive queries
+_cache: dict = {}
+CACHE_TTL = 300  # 5 minutes
+
+
+def _cache_get(key):
+    entry = _cache.get(key)
+    if entry and time.time() - entry["ts"] < CACHE_TTL:
+        return entry["data"]
+    return None
+
+
+def _cache_set(key, data):
+    _cache[key] = {"data": data, "ts": time.time()}
+
+
+def _compute_health():
+    """Run all health queries. Called from background thread and on-demand."""
+    conn = db.get_db(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT MIN(ts), MAX(ts), COALESCE(SUM(posts),0), COALESCE(SUM(likes),0), "
+            "COALESCE(SUM(reposts),0), COALESCE(SUM(follows),0) FROM collector_stats"
+        ).fetchone()
+        first_ts, latest_ts, total_posts, total_likes, total_reposts, total_follows = row
+
+        db_path = Path(DB_PATH)
+        real_path = db_path.resolve()
+        db_size_mb = round(real_path.stat().st_size / (1024 * 1024), 1) if real_path.exists() else 0
+
+        # Fast because of idx_posts_root partial index
+        root_posts = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE reply_parent IS NULL AND quote_of IS NULL"
+        ).fetchone()[0]
+
+        # Single pass: collect repost counts per root post, bucket in Python
+        rows = conn.execute(
+            """SELECT COUNT(*) as rp
+               FROM engagements e
+               WHERE e.type='repost'
+                 AND EXISTS (
+                   SELECT 1 FROM posts p
+                   WHERE p.uri = e.subject_uri
+                     AND p.reply_parent IS NULL AND p.quote_of IS NULL
+                 )
+               GROUP BY e.subject_uri"""
+        ).fetchall()
+        counts = [r[0] for r in rows]
+        tiers = {str(t): sum(1 for c in counts if c >= t) for t in [1, 5, 10, 25, 50, 100, 250, 500]}
+
+        top_reposted = conn.execute(
+            """SELECT p.uri, p.text, p.did, p.time_us, COUNT(*) as rp
+               FROM engagements e
+               JOIN posts p ON e.subject_uri = p.uri
+               WHERE e.type='repost' AND p.reply_parent IS NULL AND p.quote_of IS NULL
+               GROUP BY e.subject_uri ORDER BY rp DESC LIMIT 5"""
+        ).fetchall()
+        top_posts = [
+            {"uri": r[0], "text": (r[1] or "")[:150], "did": r[2], "time_us": r[3], "reposts": r[4]}
+            for r in top_reposted
+        ]
+
+        hourly = conn.execute(
+            """SELECT strftime('%Y-%m-%d %H:00', ts) as hour,
+                 SUM(posts), SUM(likes), SUM(reposts), SUM(follows)
+               FROM collector_stats WHERE ts >= datetime('now', '-24 hours')
+               GROUP BY hour ORDER BY hour"""
+        ).fetchall()
+        hourly_data = [
+            {"hour": r[0], "posts": r[1], "likes": r[2], "reposts": r[3], "follows": r[4]}
+            for r in hourly
+        ]
+
+        result = {
+            "collection_started": first_ts,
+            "latest_stat": latest_ts,
+            "db_size_mb": db_size_mb,
+            "totals": {
+                "posts": total_posts,
+                "root_posts": root_posts,
+                "likes": total_likes,
+                "reposts": total_reposts,
+                "follows": total_follows,
+            },
+            "repost_tiers": tiers,
+            "top_reposted": top_posts,
+            "hourly_throughput": hourly_data,
+        }
+        _cache_set("health", result)
+        return result
+    finally:
+        conn.close()
+
+
+def _health_warmer():
+    """Background thread: compute health cache every CACHE_TTL seconds."""
+    # Initial warm-up after a short delay so the service starts fast
+    time.sleep(5)
+    while True:
+        try:
+            _compute_health()
+        except Exception as e:
+            print(f"[health warmer] error: {e}")
+        time.sleep(CACHE_TTL)
 
 app = Flask(__name__)
 DB_PATH = db.DEFAULT_DB_PATH
@@ -29,15 +136,11 @@ def index():
 def api_status():
     conn = get_conn()
     try:
-        counts = {}
-        counts["posts"] = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
-        counts["likes"] = conn.execute(
-            "SELECT COUNT(*) FROM engagements WHERE type='like'"
-        ).fetchone()[0]
-        counts["reposts"] = conn.execute(
-            "SELECT COUNT(*) FROM engagements WHERE type='repost'"
-        ).fetchone()[0]
-        counts["follows"] = conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0]
+        # Fast: SUM collector_stats (tiny table) instead of COUNT(*) on millions of rows
+        row = conn.execute(
+            "SELECT COALESCE(SUM(posts),0), COALESCE(SUM(likes),0), COALESCE(SUM(reposts),0), COALESCE(SUM(follows),0) FROM collector_stats"
+        ).fetchone()
+        counts = {"posts": row[0], "likes": row[1], "reposts": row[2], "follows": row[3]}
 
         latest_cursor = None
         cursor_file = Path(__file__).parent / ".cursor"
@@ -46,14 +149,13 @@ def api_status():
             if text:
                 latest_cursor = int(text)
 
-        # Events per second from last 2 stats rows
-        rows = conn.execute(
-            "SELECT ts, posts, likes, reposts, follows FROM collector_stats ORDER BY ts DESC LIMIT 2"
-        ).fetchall()
+        # Events per second from last stats row
+        last_row = conn.execute(
+            "SELECT posts, likes, reposts, follows FROM collector_stats ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
         events_per_sec = 0
-        if len(rows) >= 2:
-            total_recent = sum(rows[0][1:5])
-            events_per_sec = round(total_recent / 60, 1)
+        if last_row:
+            events_per_sec = round(sum(last_row) / 60, 1)
 
         return jsonify({
             "counts": counts,
@@ -137,145 +239,44 @@ def api_top():
 @app.route("/api/viral")
 def api_viral():
     threshold = request.args.get("threshold", 100, type=int)
+    cache_key = f"viral_{threshold}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
     conn = get_conn()
     try:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM posts WHERE reply_parent IS NULL AND quote_of IS NULL"
-        ).fetchone()[0]
-        if total == 0:
-            return jsonify({"total": 0, "viral": 0, "pct": 0})
+        # Viral count: posts with >= threshold reposts (uses idx_eng_type_subject)
         viral = conn.execute(
-            """
-            SELECT COUNT(*) FROM (
-                SELECT p.uri, COALESCE(r.reposts, 0) as rp
-                FROM posts p
-                LEFT JOIN (
-                    SELECT subject_uri, COUNT(*) as reposts
-                    FROM engagements WHERE type='repost'
-                    GROUP BY subject_uri
-                ) r ON p.uri = r.subject_uri
-                WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
-                  AND rp >= ?
-            )
-            """,
+            """SELECT COUNT(*) FROM (
+                SELECT e.subject_uri
+                FROM engagements e
+                JOIN posts p ON e.subject_uri = p.uri
+                WHERE e.type='repost' AND p.reply_parent IS NULL AND p.quote_of IS NULL
+                GROUP BY e.subject_uri
+                HAVING COUNT(*) >= ?
+            )""",
             (threshold,),
         ).fetchone()[0]
-        return jsonify({"total": total, "viral": viral, "pct": round(viral / total * 100, 4)})
+        # Use fast collector_stats sum for total instead of COUNT(*) on posts
+        total_posts = conn.execute(
+            "SELECT COALESCE(SUM(posts),0) FROM collector_stats"
+        ).fetchone()[0]
+        result = {"total": total_posts, "viral": viral, "pct": round(viral / total_posts * 100, 4) if total_posts else 0}
+        _cache_set(cache_key, result)
+        return jsonify(result)
     finally:
         conn.close()
 
 
 @app.route("/api/health")
 def api_health():
-    """Collection health stats for morning check — should I keep collecting?"""
-    conn = get_conn()
-    try:
-        # Collection duration
-        first_ts = conn.execute("SELECT MIN(ts) FROM collector_stats").fetchone()[0]
-        latest_ts = conn.execute("SELECT MAX(ts) FROM collector_stats").fetchone()[0]
-
-        # DB file size
-        db_path = Path(DB_PATH)
-        db_size_mb = round(db_path.stat().st_size / (1024 * 1024), 1) if db_path.exists() else 0
-
-        # Total counts
-        total_posts = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
-        root_posts = conn.execute(
-            "SELECT COUNT(*) FROM posts WHERE reply_parent IS NULL AND quote_of IS NULL"
-        ).fetchone()[0]
-        total_likes = conn.execute(
-            "SELECT COUNT(*) FROM engagements WHERE type='like'"
-        ).fetchone()[0]
-        total_reposts = conn.execute(
-            "SELECT COUNT(*) FROM engagements WHERE type='repost'"
-        ).fetchone()[0]
-        total_follows = conn.execute("SELECT COUNT(*) FROM follows").fetchone()[0]
-        unique_authors = conn.execute("SELECT COUNT(DISTINCT did) FROM posts").fetchone()[0]
-
-        # Engagement distribution — what % of root posts have any engagement?
-        posts_with_likes = conn.execute(
-            """SELECT COUNT(DISTINCT e.subject_uri)
-               FROM engagements e
-               JOIN posts p ON e.subject_uri = p.uri
-               WHERE e.type='like' AND p.reply_parent IS NULL AND p.quote_of IS NULL"""
-        ).fetchone()[0]
-        posts_with_reposts = conn.execute(
-            """SELECT COUNT(DISTINCT e.subject_uri)
-               FROM engagements e
-               JOIN posts p ON e.subject_uri = p.uri
-               WHERE e.type='repost' AND p.reply_parent IS NULL AND p.quote_of IS NULL"""
-        ).fetchone()[0]
-
-        # Repost tiers — how many posts hit various repost counts
-        tiers = {}
-        for tier in [1, 5, 10, 25, 50, 100, 250, 500]:
-            count = conn.execute(
-                """SELECT COUNT(*) FROM (
-                    SELECT e.subject_uri, COUNT(*) as rp
-                    FROM engagements e
-                    JOIN posts p ON e.subject_uri = p.uri
-                    WHERE e.type='repost' AND p.reply_parent IS NULL AND p.quote_of IS NULL
-                    GROUP BY e.subject_uri
-                    HAVING rp >= ?
-                )""",
-                (tier,),
-            ).fetchone()[0]
-            tiers[str(tier)] = count
-
-        # Top 5 most reposted posts ever
-        top_reposted = conn.execute(
-            """SELECT p.uri, p.text, p.did, p.time_us, COUNT(*) as rp
-               FROM engagements e
-               JOIN posts p ON e.subject_uri = p.uri
-               WHERE e.type='repost' AND p.reply_parent IS NULL AND p.quote_of IS NULL
-               GROUP BY e.subject_uri
-               ORDER BY rp DESC
-               LIMIT 5"""
-        ).fetchall()
-        top_posts = [
-            {"uri": r[0], "text": (r[1] or "")[:150], "did": r[2], "time_us": r[3], "reposts": r[4]}
-            for r in top_reposted
-        ]
-
-        # Hourly throughput (last 24h)
-        hourly = conn.execute(
-            """SELECT
-                 strftime('%Y-%m-%d %H:00', ts) as hour,
-                 SUM(posts) as posts, SUM(likes) as likes,
-                 SUM(reposts) as reposts, SUM(follows) as follows
-               FROM collector_stats
-               WHERE ts >= datetime('now', '-24 hours')
-               GROUP BY hour ORDER BY hour"""
-        ).fetchall()
-        hourly_data = [
-            {"hour": r[0], "posts": r[1], "likes": r[2], "reposts": r[3], "follows": r[4]}
-            for r in hourly
-        ]
-
-        return jsonify({
-            "collection_started": first_ts,
-            "latest_stat": latest_ts,
-            "db_size_mb": db_size_mb,
-            "totals": {
-                "posts": total_posts,
-                "root_posts": root_posts,
-                "likes": total_likes,
-                "reposts": total_reposts,
-                "follows": total_follows,
-                "unique_authors": unique_authors,
-            },
-            "engagement_coverage": {
-                "root_posts_with_likes": posts_with_likes,
-                "root_posts_with_reposts": posts_with_reposts,
-                "pct_with_likes": round(posts_with_likes / root_posts * 100, 1) if root_posts else 0,
-                "pct_with_reposts": round(posts_with_reposts / root_posts * 100, 1) if root_posts else 0,
-            },
-            "repost_tiers": tiers,
-            "top_reposted": top_posts,
-            "hourly_throughput": hourly_data,
-        })
-    finally:
-        conn.close()
+    """Serve from background cache — never blocks the request."""
+    cached = _cache_get("health")
+    if cached:
+        return jsonify(cached)
+    # Cache miss (first request after startup): compute inline, subsequent served from cache
+    return jsonify(_compute_health())
 
 
 @app.route("/api/recent")
@@ -429,6 +430,9 @@ def main():
     global DB_PATH
     if args.db:
         DB_PATH = Path(args.db)
+
+    # Start background health cache warmer
+    threading.Thread(target=_health_warmer, daemon=True).start()
 
     app.run(host="0.0.0.0", port=args.port, debug=False)
 

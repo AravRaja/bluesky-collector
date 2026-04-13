@@ -64,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_posts_time  ON posts(time_us);
 CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts(reply_root);
 CREATE INDEX IF NOT EXISTS idx_posts_reply_parent ON posts(reply_parent) WHERE reply_parent IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_posts_quote ON posts(quote_of) WHERE quote_of IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_posts_root ON posts(uri) WHERE reply_parent IS NULL AND quote_of IS NULL;
 """
 
 

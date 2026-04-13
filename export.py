@@ -4,6 +4,9 @@ Layer 1: root_posts.parquet — all viral posts + sampled non-viral
 Layer 2: reposts.parquet, replies.parquet, quotes.parquet, likes.parquet
          (cascade events within --cascade-window-min of post creation)
 
+Fast approach: find viral posts via repost index first, then sample non-viral.
+Never scans all root posts — runs in ~1-2 minutes even on large DBs.
+
 Usage:
     python export.py [--since 2024-04-01] [--until 2024-04-15]
                      [--min-age-hours 2] [--sample-ratio 10]
@@ -18,7 +21,10 @@ from pathlib import Path
 import pandas as pd
 
 import db
-from virality_threshold import is_viral
+from virality_threshold import is_viral as _is_viral_fn
+
+# Repost threshold for "viral" — must match virality_threshold.py
+VIRAL_REPOST_THRESHOLD = 100
 
 
 def ts_to_time_us(ts_str):
@@ -40,53 +46,85 @@ def _add_time_delta(df, time_col, time_map, uri_col="root_post_uri"):
 
 def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
                 cascade_window_min, out_dir):
-    """Run the full layered export."""
     out_dir.mkdir(parents=True, exist_ok=True)
     window_sec = cascade_window_min * 60
 
     # -------------------------------------------------------------------
-    # Step 1: Root posts in date range
+    # Step 1: Viral posts via repost index — fast, no full table scan
     # -------------------------------------------------------------------
-    print("Querying root posts...")
-    root_posts = pd.read_sql_query(
-        """
-        SELECT uri, did, time_us, created_at, text, langs,
-               has_embed, embed_type
-        FROM posts
-        WHERE reply_parent IS NULL AND quote_of IS NULL
-          AND time_us >= ? AND time_us <= ?
-          AND time_us <= ?
-        """,
+    print("Finding viral posts (via repost index)...")
+    viral_posts = pd.read_sql_query(
+        """SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
+                  p.has_embed, p.embed_type, COUNT(*) as total_reposts
+           FROM engagements e
+           JOIN posts p ON e.subject_uri = p.uri
+           WHERE e.type = 'repost'
+             AND p.reply_parent IS NULL AND p.quote_of IS NULL
+             AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?
+           GROUP BY e.subject_uri
+           HAVING COUNT(*) >= ?""",
         conn,
-        params=(since_us, until_us, min_age_us),
+        params=(since_us, until_us, min_age_us, VIRAL_REPOST_THRESHOLD),
     )
-    print(f"  Found {len(root_posts):,} root posts")
-    if root_posts.empty:
-        print("No root posts found in range. Exiting.")
-        return
+    print(f"  Found {len(viral_posts)} viral posts")
 
     # -------------------------------------------------------------------
-    # Step 2: Engagement counts — use SQL joins (no huge IN lists)
+    # Step 2: Sample non-viral posts — most recent N, uses idx_posts_root_time
     # -------------------------------------------------------------------
-    print("Counting engagements...")
+    n_sample = len(viral_posts) * sample_ratio
+    print(f"Sampling {n_sample} non-viral posts (most recent)...")
 
-    # Store root post URIs in a temp table for efficient joining
-    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _root_uris (uri TEXT PRIMARY KEY)")
-    conn.execute("DELETE FROM _root_uris")
-    conn.executemany(
-        "INSERT OR IGNORE INTO _root_uris VALUES (?)",
-        [(u,) for u in root_posts["uri"].tolist()],
-    )
+    viral_uris = viral_posts["uri"].tolist()
+    if viral_uris:
+        # Exclude viral URIs (small list, fine as IN clause)
+        ph = ",".join("?" * len(viral_uris))
+        non_viral_posts = pd.read_sql_query(
+            f"""SELECT uri, did, time_us, created_at, text, langs, has_embed, embed_type
+                FROM posts
+                WHERE reply_parent IS NULL AND quote_of IS NULL
+                  AND time_us >= ? AND time_us <= ? AND time_us <= ?
+                  AND uri NOT IN ({ph})
+                ORDER BY time_us DESC
+                LIMIT ?""",
+            conn,
+            params=(since_us, until_us, min_age_us, *viral_uris, n_sample),
+        )
+    else:
+        non_viral_posts = pd.read_sql_query(
+            """SELECT uri, did, time_us, created_at, text, langs, has_embed, embed_type
+               FROM posts
+               WHERE reply_parent IS NULL AND quote_of IS NULL
+                 AND time_us >= ? AND time_us <= ? AND time_us <= ?
+               ORDER BY time_us DESC
+               LIMIT ?""",
+            conn,
+            params=(since_us, until_us, min_age_us, n_sample),
+        )
+
+    viral_posts["is_viral"] = True
+    non_viral_posts["is_viral"] = False
+    non_viral_posts["total_reposts"] = 0
+    layer1 = pd.concat([viral_posts, non_viral_posts], ignore_index=True)
+    print(f"  Layer 1: {len(viral_posts)} viral + {len(non_viral_posts)} non-viral = {len(layer1)} posts")
+
+    # -------------------------------------------------------------------
+    # Step 3: Count all engagements for the ~2000 sampled posts (small temp table)
+    # -------------------------------------------------------------------
+    print("Counting engagements for sampled posts...")
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _export_uris (uri TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _export_uris")
+    conn.executemany("INSERT OR IGNORE INTO _export_uris VALUES (?)",
+                     [(u,) for u in layer1["uri"].tolist()])
     conn.commit()
 
     eng_counts = pd.read_sql_query(
         """SELECT e.subject_uri, e.type, COUNT(*) as cnt
            FROM engagements e
-           JOIN _root_uris r ON e.subject_uri = r.uri
+           JOIN _export_uris x ON e.subject_uri = x.uri
            GROUP BY e.subject_uri, e.type""",
         conn,
     )
-    likes_map   = {}
+    likes_map = {}
     reposts_map = {}
     for _, row in eng_counts.iterrows():
         if row["type"] == "like":
@@ -96,8 +134,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
 
     reply_counts = pd.read_sql_query(
         """SELECT p.reply_parent as uri, COUNT(*) as cnt
-           FROM posts p
-           JOIN _root_uris r ON p.reply_parent = r.uri
+           FROM posts p JOIN _export_uris x ON p.reply_parent = x.uri
            GROUP BY p.reply_parent""",
         conn,
     )
@@ -105,53 +142,37 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
 
     quote_counts = pd.read_sql_query(
         """SELECT p.quote_of as uri, COUNT(*) as cnt
-           FROM posts p
-           JOIN _root_uris r ON p.quote_of = r.uri
+           FROM posts p JOIN _export_uris x ON p.quote_of = x.uri
            GROUP BY p.quote_of""",
         conn,
     )
     quotes_map = dict(zip(quote_counts["uri"], quote_counts["cnt"]))
 
-    root_posts["total_likes"]   = root_posts["uri"].map(likes_map).fillna(0).astype(int)
-    root_posts["total_reposts"] = root_posts["uri"].map(reposts_map).fillna(0).astype(int)
-    root_posts["total_replies"] = root_posts["uri"].map(replies_map).fillna(0).astype(int)
-    root_posts["total_quotes"]  = root_posts["uri"].map(quotes_map).fillna(0).astype(int)
+    layer1["total_likes"]   = layer1["uri"].map(likes_map).fillna(0).astype(int)
+    # viral already has total_reposts from the aggregation; fill non-viral from map
+    layer1["total_reposts"] = layer1.apply(
+        lambda r: r["total_reposts"] if r["is_viral"] else reposts_map.get(r["uri"], 0),
+        axis=1,
+    ).astype(int)
+    layer1["total_replies"] = layer1["uri"].map(replies_map).fillna(0).astype(int)
+    layer1["total_quotes"]  = layer1["uri"].map(quotes_map).fillna(0).astype(int)
 
     # -------------------------------------------------------------------
-    # Step 3: Author profiles
+    # Step 4: Author profiles
     # -------------------------------------------------------------------
     print("Looking up author profiles...")
     profiles = pd.read_sql_query(
         """SELECT pr.did, pr.handle, pr.followers_count, pr.follows_count, pr.posts_count
            FROM profiles pr
-           JOIN (SELECT DISTINCT posts.did FROM posts JOIN _root_uris ON posts.uri = _root_uris.uri) d
+           JOIN (SELECT DISTINCT did FROM posts p JOIN _export_uris x ON p.uri = x.uri) d
              ON pr.did = d.did""",
         conn,
     )
     pm = profiles.set_index("did").to_dict("index")
-    root_posts["author_handle"]      = root_posts["did"].map(lambda d: pm.get(d, {}).get("handle"))
-    root_posts["author_followers"]    = root_posts["did"].map(lambda d: pm.get(d, {}).get("followers_count", 0))
-    root_posts["author_follows"]      = root_posts["did"].map(lambda d: pm.get(d, {}).get("follows_count", 0))
-    root_posts["author_posts_count"]  = root_posts["did"].map(lambda d: pm.get(d, {}).get("posts_count", 0))
-
-    # -------------------------------------------------------------------
-    # Step 4: Virality label + sampling
-    # -------------------------------------------------------------------
-    print("Applying virality threshold...")
-    root_posts["is_viral"] = root_posts.apply(
-        lambda r: is_viral(
-            r["total_likes"], r["total_reposts"], r["total_replies"],
-            r["total_quotes"], r["author_followers"] or 0,
-        ),
-        axis=1,
-    )
-
-    viral     = root_posts[root_posts["is_viral"]]
-    non_viral = root_posts[~root_posts["is_viral"]]
-    n_sample  = min(len(non_viral), len(viral) * sample_ratio)
-    sampled   = non_viral.sample(n=n_sample, random_state=42) if n_sample > 0 else non_viral.head(0)
-    layer1    = pd.concat([viral, sampled], ignore_index=True)
-    print(f"  Layer 1: {len(viral)} viral + {n_sample} non-viral = {len(layer1)} posts")
+    layer1["author_handle"]      = layer1["did"].map(lambda d: pm.get(d, {}).get("handle"))
+    layer1["author_followers"]    = layer1["did"].map(lambda d: pm.get(d, {}).get("followers_count", 0))
+    layer1["author_follows"]      = layer1["did"].map(lambda d: pm.get(d, {}).get("follows_count", 0))
+    layer1["author_posts_count"]  = layer1["did"].map(lambda d: pm.get(d, {}).get("posts_count", 0))
 
     # -------------------------------------------------------------------
     # Step 5: Export Layer 1
@@ -160,23 +181,11 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     layer1.to_parquet(out_dir / "root_posts.parquet", index=False)
 
     # -------------------------------------------------------------------
-    # Step 6: Rebuild temp table with only Layer 1 URIs for cascade export
+    # Step 6: Layer 2 cascade — temp table already has the right URIs
     # -------------------------------------------------------------------
-    l1_time = dict(zip(layer1["uri"], layer1["time_us"]))
+    l1_time   = dict(zip(layer1["uri"], layer1["time_us"]))
     window_us = cascade_window_min * 60 * 1_000_000
 
-    conn.execute("DELETE FROM _root_uris")
-    conn.executemany(
-        "INSERT OR IGNORE INTO _root_uris VALUES (?)",
-        [(u,) for u in layer1["uri"].tolist()],
-    )
-    conn.commit()
-
-    # -------------------------------------------------------------------
-    # Step 7: Layer 2 cascade files — all use temp table join
-    # -------------------------------------------------------------------
-
-    # Reposts
     print(f"Exporting Layer 2: reposts.parquet  (first {cascade_window_min} min)")
     reposts_df = pd.read_sql_query(
         """SELECT e.subject_uri as root_post_uri, e.did as reposter_did,
@@ -184,7 +193,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
                   p.followers_count as reposter_followers,
                   p.follows_count as reposter_follows
            FROM engagements e
-           JOIN _root_uris r ON e.subject_uri = r.uri
+           JOIN _export_uris x ON e.subject_uri = x.uri
            LEFT JOIN profiles p ON e.did = p.did
            WHERE e.type='repost'""",
         conn,
@@ -193,13 +202,12 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     reposts_df = reposts_df[reposts_df["time_delta_sec"].between(0, window_sec)]
     reposts_df.to_parquet(out_dir / "reposts.parquet", index=False)
 
-    # Likes
     print(f"Exporting Layer 2: likes.parquet    (first {cascade_window_min} min)")
     likes_df = pd.read_sql_query(
         """SELECT e.subject_uri as root_post_uri, e.did as liker_did,
                   e.time_us as like_time_us, e.created_at
            FROM engagements e
-           JOIN _root_uris r ON e.subject_uri = r.uri
+           JOIN _export_uris x ON e.subject_uri = x.uri
            WHERE e.type='like'""",
         conn,
     )
@@ -207,7 +215,6 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     likes_df = likes_df[likes_df["time_delta_sec"].between(0, window_sec)]
     likes_df.to_parquet(out_dir / "likes.parquet", index=False)
 
-    # Replies
     print(f"Exporting Layer 2: replies.parquet  (first {cascade_window_min} min)")
     replies_df = pd.read_sql_query(
         """SELECT p.reply_root as root_post_uri, p.uri as reply_uri,
@@ -217,7 +224,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
                   pr.followers_count as replier_followers,
                   pr.follows_count as replier_follows
            FROM posts p
-           JOIN _root_uris r ON p.reply_root = r.uri
+           JOIN _export_uris x ON p.reply_root = x.uri
            LEFT JOIN profiles pr ON p.did = pr.did""",
         conn,
     )
@@ -225,7 +232,6 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     replies_df = replies_df[replies_df["time_delta_sec"].between(0, window_sec)]
     replies_df.to_parquet(out_dir / "replies.parquet", index=False)
 
-    # Quotes
     print(f"Exporting Layer 2: quotes.parquet   (first {cascade_window_min} min)")
     quotes_df = pd.read_sql_query(
         """SELECT p.quote_of as root_post_uri, p.uri as quote_uri,
@@ -235,7 +241,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
                   pr.followers_count as quoter_followers,
                   pr.follows_count as quoter_follows
            FROM posts p
-           JOIN _root_uris r ON p.quote_of = r.uri
+           JOIN _export_uris x ON p.quote_of = x.uri
            LEFT JOIN profiles pr ON p.did = pr.did""",
         conn,
     )
@@ -243,7 +249,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     quotes_df = quotes_df[quotes_df["time_delta_sec"].between(0, window_sec)]
     quotes_df.to_parquet(out_dir / "quotes.parquet", index=False)
 
-    conn.execute("DROP TABLE IF EXISTS _root_uris")
+    conn.execute("DROP TABLE IF EXISTS _export_uris")
 
     print(f"\nExport complete → {out_dir}/")
     print(f"  root_posts.parquet : {len(layer1):>6} rows")
@@ -262,7 +268,7 @@ def main():
     parser.add_argument("--sample-ratio",       type=int, default=10,
                         help="Non-viral samples per viral post")
     parser.add_argument("--cascade-window-min", type=int, default=30,
-                        help="Only include cascade events within this many minutes of post creation")
+                        help="Only cascade events within this many minutes of post creation")
     parser.add_argument("--out-dir",            type=str, default="./export")
     parser.add_argument("--db",                 type=str, default=None)
     args = parser.parse_args()

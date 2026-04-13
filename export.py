@@ -20,9 +20,6 @@ import pandas as pd
 import db
 from virality_threshold import is_viral
 
-# Columns to drop from Layer 1 — Bluesky internals, not useful for ML
-_DROP_COLS = ["labels", "cid", "reply_parent", "reply_root", "quote_of", "rkey"]
-
 
 def ts_to_time_us(ts_str):
     """Convert ISO date string to unix microseconds."""
@@ -31,15 +28,13 @@ def ts_to_time_us(ts_str):
 
 
 def _add_time_delta(df, time_col, time_map, uri_col="root_post_uri"):
-    """Add time_delta_sec column — seconds after post creation."""
+    """Add time_delta_sec — seconds after post creation when each event arrived."""
     if df.empty:
-        df["time_delta_sec"] = []
+        df = df.copy()
+        df["time_delta_sec"] = pd.Series(dtype=float)
         return df
     df = df.copy()
-    df["time_delta_sec"] = df.apply(
-        lambda r: (r[time_col] - time_map.get(r[uri_col], 0)) / 1e6,
-        axis=1,
-    )
+    df["time_delta_sec"] = (df[time_col] - df[uri_col].map(time_map)) / 1e6
     return df
 
 
@@ -65,24 +60,33 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
         conn,
         params=(since_us, until_us, min_age_us),
     )
-    print(f"  Found {len(root_posts)} root posts")
+    print(f"  Found {len(root_posts):,} root posts")
     if root_posts.empty:
         print("No root posts found in range. Exiting.")
         return
 
     # -------------------------------------------------------------------
-    # Step 2: Engagement counts
+    # Step 2: Engagement counts — use SQL joins (no huge IN lists)
     # -------------------------------------------------------------------
     print("Counting engagements...")
-    uris = root_posts["uri"].tolist()
-    ph = ",".join("?" * len(uris))
+
+    # Store root post URIs in a temp table for efficient joining
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _root_uris (uri TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM _root_uris")
+    conn.executemany(
+        "INSERT OR IGNORE INTO _root_uris VALUES (?)",
+        [(u,) for u in root_posts["uri"].tolist()],
+    )
+    conn.commit()
 
     eng_counts = pd.read_sql_query(
-        f"SELECT subject_uri, type, COUNT(*) as cnt FROM engagements "
-        f"WHERE subject_uri IN ({ph}) GROUP BY subject_uri, type",
-        conn, params=uris,
+        """SELECT e.subject_uri, e.type, COUNT(*) as cnt
+           FROM engagements e
+           JOIN _root_uris r ON e.subject_uri = r.uri
+           GROUP BY e.subject_uri, e.type""",
+        conn,
     )
-    likes_map = {}
+    likes_map   = {}
     reposts_map = {}
     for _, row in eng_counts.iterrows():
         if row["type"] == "like":
@@ -91,16 +95,20 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
             reposts_map[row["subject_uri"]] = row["cnt"]
 
     reply_counts = pd.read_sql_query(
-        f"SELECT reply_parent as uri, COUNT(*) as cnt FROM posts "
-        f"WHERE reply_parent IN ({ph}) GROUP BY reply_parent",
-        conn, params=uris,
+        """SELECT p.reply_parent as uri, COUNT(*) as cnt
+           FROM posts p
+           JOIN _root_uris r ON p.reply_parent = r.uri
+           GROUP BY p.reply_parent""",
+        conn,
     )
     replies_map = dict(zip(reply_counts["uri"], reply_counts["cnt"]))
 
     quote_counts = pd.read_sql_query(
-        f"SELECT quote_of as uri, COUNT(*) as cnt FROM posts "
-        f"WHERE quote_of IN ({ph}) GROUP BY quote_of",
-        conn, params=uris,
+        """SELECT p.quote_of as uri, COUNT(*) as cnt
+           FROM posts p
+           JOIN _root_uris r ON p.quote_of = r.uri
+           GROUP BY p.quote_of""",
+        conn,
     )
     quotes_map = dict(zip(quote_counts["uri"], quote_counts["cnt"]))
 
@@ -113,18 +121,18 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     # Step 3: Author profiles
     # -------------------------------------------------------------------
     print("Looking up author profiles...")
-    author_dids = root_posts["did"].unique().tolist()
-    ph2 = ",".join("?" * len(author_dids))
     profiles = pd.read_sql_query(
-        f"SELECT did, handle, followers_count, follows_count, posts_count "
-        f"FROM profiles WHERE did IN ({ph2})",
-        conn, params=author_dids,
+        """SELECT pr.did, pr.handle, pr.followers_count, pr.follows_count, pr.posts_count
+           FROM profiles pr
+           JOIN (SELECT DISTINCT did FROM posts JOIN _root_uris ON uri = _root_uris.uri) d
+             ON pr.did = d.did""",
+        conn,
     )
     pm = profiles.set_index("did").to_dict("index")
-    root_posts["author_handle"]       = root_posts["did"].map(lambda d: pm.get(d, {}).get("handle"))
-    root_posts["author_followers"]     = root_posts["did"].map(lambda d: pm.get(d, {}).get("followers_count", 0))
-    root_posts["author_follows"]       = root_posts["did"].map(lambda d: pm.get(d, {}).get("follows_count", 0))
-    root_posts["author_posts_count"]   = root_posts["did"].map(lambda d: pm.get(d, {}).get("posts_count", 0))
+    root_posts["author_handle"]      = root_posts["did"].map(lambda d: pm.get(d, {}).get("handle"))
+    root_posts["author_followers"]    = root_posts["did"].map(lambda d: pm.get(d, {}).get("followers_count", 0))
+    root_posts["author_follows"]      = root_posts["did"].map(lambda d: pm.get(d, {}).get("follows_count", 0))
+    root_posts["author_posts_count"]  = root_posts["did"].map(lambda d: pm.get(d, {}).get("posts_count", 0))
 
     # -------------------------------------------------------------------
     # Step 4: Virality label + sampling
@@ -152,24 +160,34 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     layer1.to_parquet(out_dir / "root_posts.parquet", index=False)
 
     # -------------------------------------------------------------------
-    # Step 6: Export Layer 2 — cascade within window
+    # Step 6: Rebuild temp table with only Layer 1 URIs for cascade export
     # -------------------------------------------------------------------
-    l1_uris    = layer1["uri"].tolist()
-    l1_time    = dict(zip(layer1["uri"], layer1["time_us"]))
-    ph_l1      = ",".join("?" * len(l1_uris))
-    window_us  = cascade_window_min * 60 * 1_000_000
+    l1_time = dict(zip(layer1["uri"], layer1["time_us"]))
+    window_us = cascade_window_min * 60 * 1_000_000
+
+    conn.execute("DELETE FROM _root_uris")
+    conn.executemany(
+        "INSERT OR IGNORE INTO _root_uris VALUES (?)",
+        [(u,) for u in layer1["uri"].tolist()],
+    )
+    conn.commit()
+
+    # -------------------------------------------------------------------
+    # Step 7: Layer 2 cascade files — all use temp table join
+    # -------------------------------------------------------------------
 
     # Reposts
     print(f"Exporting Layer 2: reposts.parquet  (first {cascade_window_min} min)")
     reposts_df = pd.read_sql_query(
-        f"""SELECT e.subject_uri as root_post_uri, e.did as reposter_did,
-                   e.time_us as repost_time_us, e.created_at,
-                   p.followers_count as reposter_followers,
-                   p.follows_count as reposter_follows
-            FROM engagements e
-            LEFT JOIN profiles p ON e.did = p.did
-            WHERE e.type='repost' AND e.subject_uri IN ({ph_l1})""",
-        conn, params=l1_uris,
+        """SELECT e.subject_uri as root_post_uri, e.did as reposter_did,
+                  e.time_us as repost_time_us, e.created_at,
+                  p.followers_count as reposter_followers,
+                  p.follows_count as reposter_follows
+           FROM engagements e
+           JOIN _root_uris r ON e.subject_uri = r.uri
+           LEFT JOIN profiles p ON e.did = p.did
+           WHERE e.type='repost'""",
+        conn,
     )
     reposts_df = _add_time_delta(reposts_df, "repost_time_us", l1_time)
     reposts_df = reposts_df[reposts_df["time_delta_sec"].between(0, window_sec)]
@@ -178,11 +196,12 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     # Likes
     print(f"Exporting Layer 2: likes.parquet    (first {cascade_window_min} min)")
     likes_df = pd.read_sql_query(
-        f"""SELECT subject_uri as root_post_uri, did as liker_did,
-                   time_us as like_time_us, created_at
-            FROM engagements
-            WHERE type='like' AND subject_uri IN ({ph_l1})""",
-        conn, params=l1_uris,
+        """SELECT e.subject_uri as root_post_uri, e.did as liker_did,
+                  e.time_us as like_time_us, e.created_at
+           FROM engagements e
+           JOIN _root_uris r ON e.subject_uri = r.uri
+           WHERE e.type='like'""",
+        conn,
     )
     likes_df = _add_time_delta(likes_df, "like_time_us", l1_time)
     likes_df = likes_df[likes_df["time_delta_sec"].between(0, window_sec)]
@@ -191,16 +210,16 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     # Replies
     print(f"Exporting Layer 2: replies.parquet  (first {cascade_window_min} min)")
     replies_df = pd.read_sql_query(
-        f"""SELECT p.reply_root as root_post_uri, p.uri as reply_uri,
-                   p.did as replier_did, p.time_us as reply_time_us,
-                   p.text as reply_text, p.has_embed as reply_has_embed,
-                   p.created_at,
-                   pr.followers_count as replier_followers,
-                   pr.follows_count as replier_follows
-            FROM posts p
-            LEFT JOIN profiles pr ON p.did = pr.did
-            WHERE p.reply_root IN ({ph_l1})""",
-        conn, params=l1_uris,
+        """SELECT p.reply_root as root_post_uri, p.uri as reply_uri,
+                  p.did as replier_did, p.time_us as reply_time_us,
+                  p.text as reply_text, p.has_embed as reply_has_embed,
+                  p.created_at,
+                  pr.followers_count as replier_followers,
+                  pr.follows_count as replier_follows
+           FROM posts p
+           JOIN _root_uris r ON p.reply_root = r.uri
+           LEFT JOIN profiles pr ON p.did = pr.did""",
+        conn,
     )
     replies_df = _add_time_delta(replies_df, "reply_time_us", l1_time)
     replies_df = replies_df[replies_df["time_delta_sec"].between(0, window_sec)]
@@ -209,20 +228,22 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     # Quotes
     print(f"Exporting Layer 2: quotes.parquet   (first {cascade_window_min} min)")
     quotes_df = pd.read_sql_query(
-        f"""SELECT p.quote_of as root_post_uri, p.uri as quote_uri,
-                   p.did as quoter_did, p.time_us as quote_time_us,
-                   p.text as quote_text, p.has_embed as quote_has_embed,
-                   p.created_at,
-                   pr.followers_count as quoter_followers,
-                   pr.follows_count as quoter_follows
-            FROM posts p
-            LEFT JOIN profiles pr ON p.did = pr.did
-            WHERE p.quote_of IN ({ph_l1})""",
-        conn, params=l1_uris,
+        """SELECT p.quote_of as root_post_uri, p.uri as quote_uri,
+                  p.did as quoter_did, p.time_us as quote_time_us,
+                  p.text as quote_text, p.has_embed as quote_has_embed,
+                  p.created_at,
+                  pr.followers_count as quoter_followers,
+                  pr.follows_count as quoter_follows
+           FROM posts p
+           JOIN _root_uris r ON p.quote_of = r.uri
+           LEFT JOIN profiles pr ON p.did = pr.did""",
+        conn,
     )
     quotes_df = _add_time_delta(quotes_df, "quote_time_us", l1_time)
     quotes_df = quotes_df[quotes_df["time_delta_sec"].between(0, window_sec)]
     quotes_df.to_parquet(out_dir / "quotes.parquet", index=False)
+
+    conn.execute("DROP TABLE IF EXISTS _root_uris")
 
     print(f"\nExport complete → {out_dir}/")
     print(f"  root_posts.parquet : {len(layer1):>6} rows")
@@ -234,21 +255,23 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
 
 def main():
     parser = argparse.ArgumentParser(description="Export SQLite to layered parquets")
-    parser.add_argument("--since",               type=str, default="2024-01-01")
-    parser.add_argument("--until",               type=str, default="2099-12-31")
-    parser.add_argument("--min-age-hours",        type=int, default=2)
-    parser.add_argument("--sample-ratio",         type=int, default=10)
-    parser.add_argument("--cascade-window-min",   type=int, default=30,
-                        help="Only export cascade events within this many minutes of post creation")
-    parser.add_argument("--out-dir",              type=str, default="./export")
-    parser.add_argument("--db",                   type=str, default=None)
+    parser.add_argument("--since",             type=str, default="2024-01-01")
+    parser.add_argument("--until",             type=str, default="2099-12-31")
+    parser.add_argument("--min-age-hours",      type=int, default=2,
+                        help="Only posts older than N hours (ensures cascade has time to accumulate)")
+    parser.add_argument("--sample-ratio",       type=int, default=10,
+                        help="Non-viral samples per viral post")
+    parser.add_argument("--cascade-window-min", type=int, default=30,
+                        help="Only include cascade events within this many minutes of post creation")
+    parser.add_argument("--out-dir",            type=str, default="./export")
+    parser.add_argument("--db",                 type=str, default=None)
     args = parser.parse_args()
 
-    db_path   = Path(args.db) if args.db else db.DEFAULT_DB_PATH
-    conn      = db.get_db(db_path)
-    since_us  = ts_to_time_us(args.since)
-    until_us  = ts_to_time_us(args.until)
-    now_us    = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+    db_path    = Path(args.db) if args.db else db.DEFAULT_DB_PATH
+    conn       = db.get_db(db_path)
+    since_us   = ts_to_time_us(args.since)
+    until_us   = ts_to_time_us(args.until)
+    now_us     = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
     min_age_us = now_us - (args.min_age_hours * 3600 * 1_000_000)
 
     export_data(conn, since_us, until_us, min_age_us,

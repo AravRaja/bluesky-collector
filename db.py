@@ -59,8 +59,11 @@ CREATE TABLE IF NOT EXISTS collector_stats (
 
 CREATE INDEX IF NOT EXISTS idx_eng_subject ON engagements(subject_uri);
 CREATE INDEX IF NOT EXISTS idx_eng_time    ON engagements(time_us);
+CREATE INDEX IF NOT EXISTS idx_eng_type_subject ON engagements(type, subject_uri);
 CREATE INDEX IF NOT EXISTS idx_posts_time  ON posts(time_us);
 CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts(reply_root);
+CREATE INDEX IF NOT EXISTS idx_posts_reply_parent ON posts(reply_parent) WHERE reply_parent IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_posts_quote ON posts(quote_of) WHERE quote_of IS NOT NULL;
 """
 
 
@@ -71,6 +74,7 @@ def get_db(path=None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")  # checkpoint every 1000 pages (~4MB)
     conn.executescript(SCHEMA_SQL)
     return conn
 

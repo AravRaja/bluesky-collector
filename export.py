@@ -124,7 +124,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     profiles = pd.read_sql_query(
         """SELECT pr.did, pr.handle, pr.followers_count, pr.follows_count, pr.posts_count
            FROM profiles pr
-           JOIN (SELECT DISTINCT did FROM posts JOIN _root_uris ON uri = _root_uris.uri) d
+           JOIN (SELECT DISTINCT posts.did FROM posts JOIN _root_uris ON posts.uri = _root_uris.uri) d
              ON pr.did = d.did""",
         conn,
     )

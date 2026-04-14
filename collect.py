@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 import websockets
 
 import db
+import stats_writer
 
 JETSTREAM_URL = "wss://jetstream2.us-east.bsky.network/subscribe"
 WANTED_COLLECTIONS = [
@@ -32,6 +33,8 @@ BATCH_SIZE = 500
 BATCH_INTERVAL_SEC = 5
 MAX_RECONNECT_DELAY_SEC = 60
 STATS_INTERVAL_SEC = 60
+STATS_WRITE_INTERVAL_SEC = 60
+WAL_CHECKPOINT_INTERVAL_SEC = 300  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +237,35 @@ async def stats_recorder(conn, counters, stop_event):
         prev = {k: v for k, v in counters.items()}
 
 
+async def dashboard_stats_writer(db_path, stop_event):
+    """Write dashboard JSON stats file periodically."""
+    await asyncio.sleep(10)  # let collector get going first
+    while not stop_event.is_set():
+        try:
+            stats_writer.write_stats(db_path)
+        except Exception as e:
+            print(f"[stats_writer] error: {e}")
+        try:
+            await asyncio.sleep(STATS_WRITE_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            break
+
+
+async def wal_checkpointer(db_path, stop_event):
+    """Periodically force a WAL checkpoint so the WAL stays small."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.sleep(WAL_CHECKPOINT_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            break
+        try:
+            conn = db.get_db(db_path)
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            conn.close()
+        except Exception as e:
+            print(f"[wal_checkpoint] error: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Main consumer
 # ---------------------------------------------------------------------------
@@ -254,6 +286,8 @@ async def consume_stream():
         loop.add_signal_handler(sig, stop_event.set)
 
     stats_task = asyncio.create_task(stats_recorder(conn, counters, stop_event))
+    dash_task = asyncio.create_task(dashboard_stats_writer(DB_PATH, stop_event))
+    wal_task = asyncio.create_task(wal_checkpointer(DB_PATH, stop_event))
 
     PARSERS = {
         "app.bsky.feed.post": ("posts", parse_post),
@@ -325,11 +359,12 @@ async def consume_stream():
             reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY_SEC)
 
     # Graceful shutdown
-    stats_task.cancel()
-    try:
-        await stats_task
-    except asyncio.CancelledError:
-        pass
+    for task in (stats_task, dash_task, wal_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     flush_buffers(conn, buffers, counters)
     if last_time_us is not None:

@@ -1,5 +1,3 @@
-// Minimal dashboard — OLED dark, subtle color accents
-
 const C = { blue: "#3b82f6", green: "#22c55e", amber: "#f59e0b", pink: "#ec4899" };
 
 function fmt(n) {
@@ -20,7 +18,6 @@ function badge(d) {
     return `<span class="badge">${(d.embed_type || "").replace("app.bsky.embed.", "") || "embed"}</span>`;
 }
 
-// Chart defaults
 const baseOpts = {
     responsive: true, maintainAspectRatio: false,
     interaction: { mode: "index", intersect: false },
@@ -34,7 +31,6 @@ const baseOpts = {
     },
 };
 
-// Rate chart — subtle color accents
 const rateChart = new Chart(document.getElementById("rateChart"), {
     type: "line",
     data: { labels: [], datasets: [
@@ -45,7 +41,6 @@ const rateChart = new Chart(document.getElementById("rateChart"), {
     options: baseOpts,
 });
 
-// Throughput chart
 const tpChart = new Chart(document.getElementById("throughputChart"), {
     type: "bar",
     data: { labels: [], datasets: [
@@ -56,24 +51,23 @@ const tpChart = new Chart(document.getElementById("throughputChart"), {
 });
 
 async function api(url) { return (await fetch(url)).json(); }
-let activeDetailChart = null;
 
 async function refreshStatus() {
     try {
         const d = await api("/api/status");
-        document.getElementById("s-likes").textContent = fmt(d.counts.likes);
-        document.getElementById("s-reposts").textContent = fmt(d.counts.reposts);
+        document.getElementById("s-likes").textContent = fmt(d.counts.likes || 0);
+        document.getElementById("s-reposts").textContent = fmt(d.counts.reposts || 0);
     } catch (e) {}
 }
 
 async function refreshHealth() {
     try {
         const d = await api("/api/health");
+        if (!d.totals) return;
         document.getElementById("s-roots").textContent = fmt(d.totals.root_posts);
         document.getElementById("s-db").textContent = d.db_size_mb < 1024 ? d.db_size_mb + "MB" : (d.db_size_mb / 1024).toFixed(1) + "GB";
 
-        // Tier bars with color gradient
-        const tiers = d.repost_tiers;
+        const tiers = d.repost_tiers || {};
         const keys = Object.keys(tiers).map(Number).sort((a, b) => a - b);
         const max = Math.max(...keys.map(k => tiers[String(k)]), 1);
         const tierColors = { 1: "#555", 5: "#666", 10: C.blue, 25: C.blue, 50: C.amber, 100: C.pink, 250: C.pink, 500: C.green };
@@ -84,7 +78,7 @@ async function refreshHealth() {
             return `<div class="tier"><span class="tier-label">${k}+</span><div class="tier-track"><div class="tier-fill" style="width:${pct}%;background:${color}"></div></div><span class="tier-count">${fmt(c)}</span></div>`;
         }).join("");
 
-        if (d.hourly_throughput.length) {
+        if (d.hourly_throughput && d.hourly_throughput.length) {
             tpChart.data.labels = d.hourly_throughput.map(h => h.hour.slice(11, 16));
             tpChart.data.datasets[0].data = d.hourly_throughput.map(h => h.posts);
             tpChart.data.datasets[1].data = d.hourly_throughput.map(h => h.likes);
@@ -96,6 +90,7 @@ async function refreshHealth() {
 async function refreshRate() {
     try {
         const data = await api("/api/rate?hours=6");
+        if (!data.length) return;
         rateChart.data.labels = data.map(d => d.ts.slice(11, 16));
         rateChart.data.datasets[0].data = data.map(d => d.posts);
         rateChart.data.datasets[1].data = data.map(d => d.likes);
@@ -104,8 +99,7 @@ async function refreshRate() {
     } catch (e) {}
 }
 
-// Build both table rows (desktop) and cards (mobile) for a post list
-function renderPosts(posts, tbodyId, cardsId, clickable) {
+function renderPosts(posts, tbodyId, cardsId) {
     const tbody = document.getElementById(tbodyId);
     const cards = document.getElementById(cardsId);
 
@@ -115,29 +109,17 @@ function renderPosts(posts, tbodyId, cardsId, clickable) {
         return;
     }
 
-    // Desktop table
-    tbody.innerHTML = posts.map((p, i) => {
-        const id = tbodyId + "-" + i;
-        let rows = `<tr${clickable ? ` class="clickable" data-uri="${esc(p.uri)}" data-idx="${id}" onclick="toggleDetail(this)"` : ""}>` +
+    tbody.innerHTML = posts.map(p => {
+        return `<tr>` +
             `<td class="text-col">${esc(p.text)}</td>` +
             `<td>${badge(p)}</td>` +
             `<td class="mono r">${fmt(p.likes)}</td>` +
             `<td class="mono r">${fmt(p.reposts)}</td>` +
             `<td class="mono r muted">${timeAgo(p.time_us)}</td></tr>`;
-        if (clickable) {
-            rows += `<tr class="detail" id="detail-${id}"><td colspan="5"><div class="detail-inner">` +
-                `<div class="detail-stats" id="dstats-${id}"></div>` +
-                `<div class="detail-chart"><canvas id="dchart-${id}"></canvas></div>` +
-                `<div class="detail-note">Per-minute engagement velocity — first 30 minutes</div>` +
-                `</div></td></tr>`;
-        }
-        return rows;
     }).join("");
 
-    // Mobile cards
-    cards.innerHTML = posts.map((p, i) => {
-        const id = tbodyId + "-m-" + i;
-        let html = `<div class="post-card"${clickable ? ` data-uri="${esc(p.uri)}" data-idx="${id}" onclick="toggleCardDetail(this)"` : ""}>` +
+    cards.innerHTML = posts.map(p => {
+        return `<div class="post-card">` +
             `<div class="post-card-text">${esc(p.text)}</div>` +
             `<div class="post-card-meta">` +
             `<span class="post-card-stat" style="color:${C.green}">${fmt(p.likes)} <span>likes</span></span>` +
@@ -145,128 +127,23 @@ function renderPosts(posts, tbodyId, cardsId, clickable) {
             `<span class="post-card-stat">${timeAgo(p.time_us)}</span>` +
             (p.has_embed ? ` ${badge(p)}` : "") +
             `</div></div>`;
-        if (clickable) {
-            html += `<div class="card-detail" id="cdetail-${id}">` +
-                `<div class="detail-stats" id="cdstats-${id}"></div>` +
-                `<div class="detail-chart"><canvas id="cdchart-${id}"></canvas></div>` +
-                `<div class="detail-note">Per-minute engagement velocity</div></div>`;
-        }
-        return html;
     }).join("");
 }
 
 async function refreshViral() {
     try {
-        const d = await api("/api/viral?threshold=100");
-        document.getElementById("s-viral").textContent = d.viral;
-        const posts = await api("/api/viral/posts?n=50");
-        renderPosts(posts, "viral-body", "viral-cards", true);
+        const d = await api("/api/viral");
+        document.getElementById("s-viral").textContent = d.viral || 0;
+        const posts = await api("/api/viral/posts");
+        renderPosts(posts, "viral-body", "viral-cards");
     } catch (e) {}
 }
 
 async function refreshRecent() {
     try {
-        const data = await api("/api/recent?n=30");
-        renderPosts(data, "recent-body", "recent-cards", false);
+        const data = await api("/api/recent");
+        renderPosts(data, "recent-body", "recent-cards");
     } catch (e) {}
-}
-
-// Timeline chart — shows per-minute NEW events (velocity), not cumulative
-function buildTimelineChart(canvas, buckets, statsEl) {
-    const b = buckets;
-    const lastB = b[b.length - 1];
-
-    // Stats
-    statsEl.innerHTML =
-        `<div><div class="detail-stat-value" style="color:${C.green}">${lastB.likes}</div><div class="detail-stat-label">Likes (30m)</div></div>` +
-        `<div><div class="detail-stat-value" style="color:${C.pink}">${lastB.reposts}</div><div class="detail-stat-label">Reposts (30m)</div></div>` +
-        `<div><div class="detail-stat-value" style="color:${C.blue}">${lastB.replies}</div><div class="detail-stat-label">Replies (30m)</div></div>`;
-
-    // Compute per-minute deltas (velocity)
-    const likesVel = b.map((x, i) => i === 0 ? x.likes : x.likes - b[i - 1].likes);
-    const repostsVel = b.map((x, i) => i === 0 ? x.reposts : x.reposts - b[i - 1].reposts);
-    const repliesVel = b.map((x, i) => i === 0 ? x.replies : x.replies - b[i - 1].replies);
-
-    if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
-
-    activeDetailChart = new Chart(canvas, {
-        type: "bar",
-        data: {
-            labels: b.map(x => x.minute),
-            datasets: [
-                { label: "Likes/min", data: likesVel, backgroundColor: C.green, borderRadius: 2, barPercentage: 0.8 },
-                { label: "Reposts/min", data: repostsVel, backgroundColor: C.pink, borderRadius: 2, barPercentage: 0.8 },
-                { label: "Replies/min", data: repliesVel, backgroundColor: C.blue, borderRadius: 2, barPercentage: 0.8 },
-            ],
-        },
-        options: {
-            ...baseOpts,
-            scales: {
-                x: { ...baseOpts.scales.x, title: { display: true, text: "Minutes after posting", color: "#555", font: { family: "'Inter'", size: 9 } } },
-                y: { ...baseOpts.scales.y, title: { display: true, text: "Events/min", color: "#555", font: { family: "'Inter'", size: 9 } } },
-            },
-        },
-    });
-}
-
-// Desktop: toggle detail row
-async function toggleDetail(row) {
-    const id = row.dataset.idx;
-    const uri = row.dataset.uri;
-    const detailRow = document.getElementById("detail-" + id);
-
-    if (detailRow.classList.contains("open")) {
-        detailRow.classList.remove("open");
-        row.classList.remove("expanded");
-        if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
-        return;
-    }
-    document.querySelectorAll(".detail.open").forEach(el => el.classList.remove("open"));
-    document.querySelectorAll(".clickable.expanded").forEach(el => el.classList.remove("expanded"));
-    if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
-    detailRow.classList.add("open");
-    row.classList.add("expanded");
-
-    try {
-        const d = await api("/api/post/timeline?uri=" + encodeURIComponent(uri));
-        buildTimelineChart(
-            document.getElementById("dchart-" + id),
-            d.buckets,
-            document.getElementById("dstats-" + id)
-        );
-    } catch (e) {
-        document.getElementById("dstats-" + id).innerHTML = '<div class="empty">Failed to load</div>';
-    }
-}
-
-// Mobile: toggle card detail
-async function toggleCardDetail(card) {
-    const id = card.dataset.idx;
-    const uri = card.dataset.uri;
-    const detail = document.getElementById("cdetail-" + id);
-
-    if (detail.classList.contains("open")) {
-        detail.classList.remove("open");
-        card.classList.remove("expanded");
-        if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
-        return;
-    }
-    document.querySelectorAll(".card-detail.open").forEach(el => el.classList.remove("open"));
-    document.querySelectorAll(".post-card.expanded").forEach(el => el.classList.remove("expanded"));
-    if (activeDetailChart) { activeDetailChart.destroy(); activeDetailChart = null; }
-    detail.classList.add("open");
-    card.classList.add("expanded");
-
-    try {
-        const d = await api("/api/post/timeline?uri=" + encodeURIComponent(uri));
-        buildTimelineChart(
-            document.getElementById("cdchart-" + id),
-            d.buckets,
-            document.getElementById("cdstats-" + id)
-        );
-    } catch (e) {
-        document.getElementById("cdstats-" + id).innerHTML = '<div class="empty">Failed to load</div>';
-    }
 }
 
 async function refreshAll() {

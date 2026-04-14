@@ -50,10 +50,23 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     window_sec = cascade_window_min * 60
 
     # -------------------------------------------------------------------
-    # Step 1: Viral posts via repost index — fast, no full table scan
+    # Step 1: Viral posts — from post_stats (pruned) + live engagement (recent)
     # -------------------------------------------------------------------
-    print("Finding viral posts (via repost index)...")
-    viral_posts = pd.read_sql_query(
+    print("Finding viral posts...")
+    # Old posts: totals in post_stats
+    viral_from_stats = pd.read_sql_query(
+        """SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
+                  p.has_embed, p.embed_type, ps.reposts as total_reposts
+           FROM post_stats ps
+           JOIN posts p ON ps.uri = p.uri
+           WHERE ps.reposts >= ?
+             AND p.reply_parent IS NULL AND p.quote_of IS NULL
+             AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?""",
+        conn,
+        params=(VIRAL_REPOST_THRESHOLD, since_us, until_us, min_age_us),
+    )
+    # Recent posts: engagement still in live rows
+    viral_from_live = pd.read_sql_query(
         """SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
                   p.has_embed, p.embed_type, COUNT(*) as total_reposts
            FROM engagements e
@@ -61,11 +74,14 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
            WHERE e.type = 'repost'
              AND p.reply_parent IS NULL AND p.quote_of IS NULL
              AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?
+             AND p.uri NOT IN (SELECT uri FROM post_stats)
            GROUP BY e.subject_uri
            HAVING COUNT(*) >= ?""",
         conn,
         params=(since_us, until_us, min_age_us, VIRAL_REPOST_THRESHOLD),
     )
+    viral_posts = pd.concat([viral_from_stats, viral_from_live], ignore_index=True)
+    viral_posts = viral_posts.drop_duplicates(subset=["uri"])
     print(f"  Found {len(viral_posts)} viral posts")
 
     # -------------------------------------------------------------------
@@ -108,7 +124,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     print(f"  Layer 1: {len(viral_posts)} viral + {len(non_viral_posts)} non-viral = {len(layer1)} posts")
 
     # -------------------------------------------------------------------
-    # Step 3: Count all engagements for the ~2000 sampled posts (small temp table)
+    # Step 3: Engagement totals — post_stats for old posts, live count for new
     # -------------------------------------------------------------------
     print("Counting engagements for sampled posts...")
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS _export_uris (uri TEXT PRIMARY KEY)")
@@ -117,20 +133,40 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
                      [(u,) for u in layer1["uri"].tolist()])
     conn.commit()
 
+    # post_stats totals (for posts that have been pruned)
+    ps_df = pd.read_sql_query(
+        "SELECT ps.uri, ps.likes, ps.reposts FROM post_stats ps JOIN _export_uris x ON ps.uri = x.uri",
+        conn,
+    )
+    ps_likes = dict(zip(ps_df["uri"], ps_df["likes"]))
+    ps_reposts = dict(zip(ps_df["uri"], ps_df["reposts"]))
+
+    # live engagement counts (cascade rows still in engagements table)
     eng_counts = pd.read_sql_query(
         """SELECT e.subject_uri, e.type, COUNT(*) as cnt
-           FROM engagements e
-           JOIN _export_uris x ON e.subject_uri = x.uri
+           FROM engagements e JOIN _export_uris x ON e.subject_uri = x.uri
            GROUP BY e.subject_uri, e.type""",
         conn,
     )
-    likes_map = {}
-    reposts_map = {}
+    live_likes = {}
+    live_reposts = {}
     for _, row in eng_counts.iterrows():
         if row["type"] == "like":
-            likes_map[row["subject_uri"]] = row["cnt"]
+            live_likes[row["subject_uri"]] = row["cnt"]
         elif row["type"] == "repost":
-            reposts_map[row["subject_uri"]] = row["cnt"]
+            live_reposts[row["subject_uri"]] = row["cnt"]
+
+    # For old posts: post_stats has the total (includes cascade + late).
+    # For new posts: only live counts exist. Use whichever is larger (post_stats is authoritative when it exists).
+    def get_likes(uri):
+        if uri in ps_likes:
+            return ps_likes[uri]
+        return live_likes.get(uri, 0)
+
+    def get_reposts(uri):
+        if uri in ps_reposts:
+            return ps_reposts[uri]
+        return live_reposts.get(uri, 0)
 
     reply_counts = pd.read_sql_query(
         """SELECT p.reply_parent as uri, COUNT(*) as cnt
@@ -148,12 +184,8 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     )
     quotes_map = dict(zip(quote_counts["uri"], quote_counts["cnt"]))
 
-    layer1["total_likes"]   = layer1["uri"].map(likes_map).fillna(0).astype(int)
-    # viral already has total_reposts from the aggregation; fill non-viral from map
-    layer1["total_reposts"] = layer1.apply(
-        lambda r: r["total_reposts"] if r["is_viral"] else reposts_map.get(r["uri"], 0),
-        axis=1,
-    ).astype(int)
+    layer1["total_likes"]   = layer1["uri"].map(get_likes).fillna(0).astype(int)
+    layer1["total_reposts"] = layer1["uri"].map(get_reposts).fillna(0).astype(int)
     layer1["total_replies"] = layer1["uri"].map(replies_map).fillna(0).astype(int)
     layer1["total_quotes"]  = layer1["uri"].map(quotes_map).fillna(0).astype(int)
 

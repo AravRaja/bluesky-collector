@@ -57,6 +57,14 @@ CREATE TABLE IF NOT EXISTS collector_stats (
     follows        INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS post_stats (
+    uri            TEXT PRIMARY KEY,
+    likes          INTEGER NOT NULL DEFAULT 0,
+    reposts        INTEGER NOT NULL DEFAULT 0,
+    updated_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_stats_reposts ON post_stats(reposts);
 CREATE INDEX IF NOT EXISTS idx_eng_subject ON engagements(subject_uri);
 CREATE INDEX IF NOT EXISTS idx_eng_time    ON engagements(time_us);
 CREATE INDEX IF NOT EXISTS idx_eng_type_subject ON engagements(type, subject_uri);

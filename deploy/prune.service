@@ -1,0 +1,8 @@
+[Unit]
+Description=Bluesky DB Pruner
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/.venv/bin/python prune.py --db /data/bluesky.db --keep-hours 2 --follow-keep-days 7

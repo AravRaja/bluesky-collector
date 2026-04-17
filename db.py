@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS post_stats (
     uri            TEXT PRIMARY KEY,
     likes          INTEGER NOT NULL DEFAULT 0,
     reposts        INTEGER NOT NULL DEFAULT 0,
+    reposts_3h     INTEGER,
+    reposts_4h     INTEGER,
+    reposts_6h     INTEGER,
+    reposts_12h    INTEGER,
+    reposts_24h    INTEGER,
     updated_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
 );
 

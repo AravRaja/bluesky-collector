@@ -133,13 +133,19 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
                      [(u,) for u in layer1["uri"].tolist()])
     conn.commit()
 
-    # post_stats totals (for posts that have been pruned)
+    # post_stats totals + time-bucketed snapshots
     ps_df = pd.read_sql_query(
-        "SELECT ps.uri, ps.likes, ps.reposts FROM post_stats ps JOIN _export_uris x ON ps.uri = x.uri",
+        """SELECT ps.uri, ps.likes, ps.reposts,
+                  ps.reposts_3h, ps.reposts_4h, ps.reposts_6h,
+                  ps.reposts_12h, ps.reposts_24h
+           FROM post_stats ps JOIN _export_uris x ON ps.uri = x.uri""",
         conn,
     )
     ps_likes = dict(zip(ps_df["uri"], ps_df["likes"]))
     ps_reposts = dict(zip(ps_df["uri"], ps_df["reposts"]))
+    ps_snapshots = {col: dict(zip(ps_df["uri"], ps_df[col]))
+                    for col in ["reposts_3h", "reposts_4h", "reposts_6h",
+                                "reposts_12h", "reposts_24h"]}
 
     # live engagement counts (cascade rows still in engagements table)
     eng_counts = pd.read_sql_query(
@@ -188,6 +194,10 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     layer1["total_reposts"] = layer1["uri"].map(get_reposts).fillna(0).astype(int)
     layer1["total_replies"] = layer1["uri"].map(replies_map).fillna(0).astype(int)
     layer1["total_quotes"]  = layer1["uri"].map(quotes_map).fillna(0).astype(int)
+
+    # Time-bucketed repost snapshots (None if post hasn't reached that age yet)
+    for col, snap in ps_snapshots.items():
+        layer1[col] = layer1["uri"].map(snap)
 
     # -------------------------------------------------------------------
     # Step 4: Author profiles

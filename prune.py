@@ -63,14 +63,18 @@ def main():
     # ---------------------------------------------------------------
     print("\nStep 1: Initial aggregation for new posts...")
     conn.execute(
-        """INSERT OR IGNORE INTO post_stats (uri, likes, reposts)
+        """INSERT OR IGNORE INTO post_stats (uri, likes, reposts, replies, quotes)
            SELECT p.uri,
              COALESCE((SELECT COUNT(*) FROM engagements
                        WHERE type='like' AND subject_uri=p.uri
                        AND time_us <= p.time_us + ?), 0),
              COALESCE((SELECT COUNT(*) FROM engagements
                        WHERE type='repost' AND subject_uri=p.uri
-                       AND time_us <= p.time_us + ?), 0)
+                       AND time_us <= p.time_us + ?), 0),
+             COALESCE((SELECT COUNT(*) FROM posts
+                       WHERE reply_parent=p.uri), 0),
+             COALESCE((SELECT COUNT(*) FROM posts
+                       WHERE quote_of=p.uri), 0)
            FROM posts p
            WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
              AND p.time_us < ?""",
@@ -86,10 +90,11 @@ def main():
     # ---------------------------------------------------------------
     print("Step 2: Incrementing post_stats with late engagement...")
     conn.execute(
-        """INSERT INTO post_stats (uri, likes, reposts)
+        """INSERT INTO post_stats (uri, likes, reposts, replies, quotes)
            SELECT e.subject_uri,
                SUM(CASE WHEN e.type='like' THEN 1 ELSE 0 END),
-               SUM(CASE WHEN e.type='repost' THEN 1 ELSE 0 END)
+               SUM(CASE WHEN e.type='repost' THEN 1 ELSE 0 END),
+               0, 0
            FROM engagements e
            JOIN posts p ON e.subject_uri = p.uri
            WHERE p.time_us < ?
@@ -100,6 +105,18 @@ def main():
                reposts = post_stats.reposts + excluded.reposts,
                updated_at = strftime('%Y-%m-%dT%H:%M:%S','now')""",
         (min_post_age_us, window_us),
+    )
+    conn.commit()
+
+    # Refresh reply/quote counts (these are posts, never deleted, so recount is safe)
+    print("  Refreshing reply/quote counts...")
+    conn.execute(
+        """UPDATE post_stats SET
+             replies = COALESCE((SELECT COUNT(*) FROM posts WHERE reply_parent=post_stats.uri), 0),
+             quotes = COALESCE((SELECT COUNT(*) FROM posts WHERE quote_of=post_stats.uri), 0),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%S','now')
+           WHERE uri IN (SELECT uri FROM posts WHERE time_us < ? AND reply_parent IS NULL AND quote_of IS NULL)""",
+        (min_post_age_us,),
     )
     conn.commit()
 

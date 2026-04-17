@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS post_stats (
     uri            TEXT PRIMARY KEY,
     likes          INTEGER NOT NULL DEFAULT 0,
     reposts        INTEGER NOT NULL DEFAULT 0,
+    replies        INTEGER NOT NULL DEFAULT 0,
+    quotes         INTEGER NOT NULL DEFAULT 0,
     reposts_3h     INTEGER,
     reposts_4h     INTEGER,
     reposts_6h     INTEGER,

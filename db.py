@@ -91,7 +91,7 @@ def get_db(path=None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=10000")  # wait up to 10s if DB is locked
+    conn.execute("PRAGMA busy_timeout=60000")  # wait up to 60s if DB is locked
     conn.execute("PRAGMA wal_autocheckpoint=1000")  # checkpoint every 1000 pages (~4MB)
     conn.executescript(SCHEMA_SQL)
     return conn
@@ -102,7 +102,7 @@ def get_reader(path=None):
     path = path or DEFAULT_DB_PATH
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.execute("PRAGMA query_only=ON")
     return conn
 

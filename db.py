@@ -97,6 +97,16 @@ def get_db(path=None):
     return conn
 
 
+def get_reader(path=None):
+    """Open a read-only connection — no schema setup, no write lock."""
+    path = path or DEFAULT_DB_PATH
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
 def insert_posts(conn, rows):
     """Batch insert posts. Skips duplicates via INSERT OR IGNORE."""
     if not rows:

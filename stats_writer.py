@@ -28,9 +28,8 @@ def _engagement_totals(conn, uri):
 
 
 def write_stats(db_path):
-    conn = db.get_db(db_path)
+    conn = db.get_reader(db_path)
     try:
-        conn.execute("PRAGMA query_only=ON")
 
         # totals from collector_stats (tiny table, instant)
         row = conn.execute(

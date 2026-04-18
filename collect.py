@@ -11,6 +11,7 @@ Usage:
 import asyncio
 import json
 import signal
+import sqlite3
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -264,9 +265,9 @@ async def wal_checkpointer(db_path, stop_event):
         except asyncio.CancelledError:
             break
         try:
-            conn = db.get_db(db_path)
-            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            conn.close()
+            wal_conn = sqlite3.connect(str(db_path))
+            wal_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            wal_conn.close()
         except Exception as e:
             print(f"[wal_checkpoint] error: {e}")
 

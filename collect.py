@@ -231,12 +231,15 @@ async def stats_recorder(conn, counters, stop_event):
             await asyncio.sleep(STATS_INTERVAL_SEC)
         except asyncio.CancelledError:
             break
-        delta_posts = counters["posts"] - prev["posts"]
-        delta_likes = counters["likes"] - prev["likes"]
-        delta_reposts = counters["reposts"] - prev["reposts"]
-        delta_follows = counters["follows"] - prev["follows"]
-        db.record_stats(conn, delta_posts, delta_likes, delta_reposts, delta_follows)
-        prev = {k: v for k, v in counters.items()}
+        try:
+            delta_posts = counters["posts"] - prev["posts"]
+            delta_likes = counters["likes"] - prev["likes"]
+            delta_reposts = counters["reposts"] - prev["reposts"]
+            delta_follows = counters["follows"] - prev["follows"]
+            db.record_stats(conn, delta_posts, delta_likes, delta_reposts, delta_follows)
+            prev = {k: v for k, v in counters.items()}
+        except Exception as e:
+            print(f"[stats_recorder] error: {e}")
 
 
 async def dashboard_stats_writer(db_path, stop_event):
@@ -339,7 +342,11 @@ async def consume_stream():
                     buf_len = len(buffers["posts"]) + len(buffers["engagements"]) + len(buffers["follows"])
                     now = time.time()
                     if buf_len >= BATCH_SIZE or (now - last_flush_time) >= BATCH_INTERVAL_SEC:
-                        flushed = flush_buffers(conn, buffers, counters)
+                        try:
+                            flushed = flush_buffers(conn, buffers, counters)
+                        except Exception as e:
+                            print(f"[flush] error: {e}, retrying next cycle")
+                            continue
                         if last_time_us is not None:
                             save_cursor(last_time_us)
                         elapsed = now - start_time

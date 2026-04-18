@@ -376,7 +376,10 @@ async def consume_stream():
         except asyncio.CancelledError:
             pass
 
-    flush_buffers(conn, buffers, counters)
+    try:
+        flush_buffers(conn, buffers, counters)
+    except Exception as e:
+        print(f"[shutdown flush] error: {e}, cursor not advanced — will replay on restart")
     if last_time_us is not None:
         save_cursor(last_time_us)
 

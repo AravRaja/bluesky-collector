@@ -77,9 +77,11 @@ def parse_post(msg):
     reply = record.get("reply")
     reply_parent = None
     reply_root = None
-    if reply:
-        reply_parent = reply.get("parent", {}).get("uri")
-        reply_root = reply.get("root", {}).get("uri")
+    if reply and isinstance(reply, dict):
+        parent = reply.get("parent")
+        root = reply.get("root")
+        reply_parent = parent.get("uri") if isinstance(parent, dict) else None
+        reply_root = root.get("uri") if isinstance(root, dict) else None
 
     # Quote detection — embed with record ref
     quote_of = None

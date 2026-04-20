@@ -208,19 +208,20 @@ def main():
     print(f"Cascade window: {args.keep_hours}h | Follow retention: {args.follow_keep_days}d")
     print(f"Batch size: {BATCH_SIZE} | Sleep between batches: {SLEEP_SEC}s")
 
-    late_count = conn.execute(
-        """SELECT COUNT(*) FROM engagements e
-           JOIN posts p ON e.subject_uri = p.uri
-           WHERE p.time_us < ? AND e.time_us > p.time_us + ?""",
-        (min_post_age_us, window_us),
-    ).fetchone()[0]
-    follow_count = conn.execute(
-        "SELECT COUNT(*) FROM follows WHERE time_us < ?", (follow_cutoff_us,)
-    ).fetchone()[0]
-    print(f"  Late engagement to process: {late_count:,}")
-    print(f"  Old follows to delete:      {follow_count:,}")
-
     if args.dry_run:
+        # Cheap counts only — no JOIN across large tables
+        follow_count = conn.execute(
+            "SELECT COUNT(*) FROM follows WHERE time_us < ?", (follow_cutoff_us,)
+        ).fetchone()[0]
+        root_untracked = conn.execute(
+            """SELECT COUNT(*) FROM posts p
+               WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
+                 AND p.time_us < ?
+                 AND NOT EXISTS (SELECT 1 FROM post_stats ps WHERE ps.uri = p.uri)""",
+            (min_post_age_us,),
+        ).fetchone()[0]
+        print(f"  Root posts needing aggregation: {root_untracked:,}")
+        print(f"  Old follows to delete:          {follow_count:,}")
         print("\nDry run — nothing changed.")
         conn.close()
         return
@@ -246,10 +247,10 @@ def main():
     n4 = step4_snapshots(conn, now_us)
     print(f"  {n4:,} snapshot cells updated ({time.time()-t:.1f}s)")
 
-    if follow_count > 0:
-        t = time.time()
-        print("Step 5: Delete old follows...")
-        n5 = step5_delete_follows(conn, follow_cutoff_us)
+    t = time.time()
+    print("Step 5: Delete old follows...")
+    n5 = step5_delete_follows(conn, follow_cutoff_us)
+    if n5 > 0:
         print(f"  {n5:,} follow rows deleted ({time.time()-t:.1f}s)")
 
     conn.execute("DELETE FROM collector_stats WHERE ts < datetime('now', '-30 days')")

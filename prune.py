@@ -28,36 +28,61 @@ SLEEP_SEC = 0.1           # yield between batches so collector can acquire the l
 
 def step1_initial_aggregation(conn, min_post_age_us, window_us):
     """Create post_stats rows for root posts older than the cascade window
-    that aren't tracked yet. Counts engagement inside the 2h cascade window."""
+    that aren't tracked yet. Counts engagement inside the 2h cascade window.
+
+    Iterates posts in time_us order using a cursor — each batch scans at most
+    BATCH_SIZE rows via idx_posts_root_time, not the whole table."""
     total = 0
-    while True:
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO post_stats (uri, likes, reposts, replies, quotes)
-               SELECT p.uri,
-                 COALESCE((SELECT COUNT(*) FROM engagements
-                           WHERE type='like' AND subject_uri=p.uri
-                           AND time_us <= p.time_us + ?), 0),
-                 COALESCE((SELECT COUNT(*) FROM engagements
-                           WHERE type='repost' AND subject_uri=p.uri
-                           AND time_us <= p.time_us + ?), 0),
-                 COALESCE((SELECT COUNT(*) FROM posts
-                           WHERE reply_parent=p.uri), 0),
-                 COALESCE((SELECT COUNT(*) FROM posts
-                           WHERE quote_of=p.uri), 0)
-               FROM posts p
+    scanned = 0
+    current = 0
+    while current < min_post_age_us:
+        rows = conn.execute(
+            """SELECT p.uri, p.time_us FROM posts p
                WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
-                 AND p.time_us < ?
-                 AND NOT EXISTS (SELECT 1 FROM post_stats ps WHERE ps.uri = p.uri)
+                 AND p.time_us >= ? AND p.time_us < ?
+               ORDER BY p.time_us
                LIMIT ?""",
-            (window_us, window_us, min_post_age_us, BATCH_SIZE),
-        )
-        conn.commit()
-        n = cur.rowcount
-        if n == 0:
+            (current, min_post_age_us, BATCH_SIZE),
+        ).fetchall()
+        if not rows:
             break
-        total += n
-        if total // 10000 != (total - n) // 10000:
-            print(f"  step1: {total:,} new post_stats rows...")
+
+        uris = [r[0] for r in rows]
+        placeholders = ",".join("?" * len(uris))
+        existing = {
+            r[0]
+            for r in conn.execute(
+                f"SELECT uri FROM post_stats WHERE uri IN ({placeholders})", uris
+            ).fetchall()
+        }
+        new_uris = [u for u in uris if u not in existing]
+
+        if new_uris:
+            new_placeholders = ",".join("?" * len(new_uris))
+            conn.execute(
+                f"""INSERT OR IGNORE INTO post_stats (uri, likes, reposts, replies, quotes)
+                    SELECT p.uri,
+                      COALESCE((SELECT COUNT(*) FROM engagements
+                                WHERE type='like' AND subject_uri=p.uri
+                                AND time_us <= p.time_us + ?), 0),
+                      COALESCE((SELECT COUNT(*) FROM engagements
+                                WHERE type='repost' AND subject_uri=p.uri
+                                AND time_us <= p.time_us + ?), 0),
+                      COALESCE((SELECT COUNT(*) FROM posts
+                                WHERE reply_parent=p.uri), 0),
+                      COALESCE((SELECT COUNT(*) FROM posts
+                                WHERE quote_of=p.uri), 0)
+                    FROM posts p WHERE p.uri IN ({new_placeholders})""",
+                [window_us, window_us] + new_uris,
+            )
+            conn.commit()
+            total += len(new_uris)
+
+        scanned += len(rows)
+        if scanned // 50000 != (scanned - len(rows)) // 50000:
+            print(f"  step1: scanned {scanned:,} posts, inserted {total:,}...")
+
+        current = rows[-1][1] + 1
         time.sleep(SLEEP_SEC)
     return total
 

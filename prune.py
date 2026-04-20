@@ -11,10 +11,14 @@
 #     python prune.py [--keep-hours 2] [--follow-keep-days 7] [--db bluesky.db]
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
 import db
+
+# Unbuffered stdout so progress is visible under systemd / nohup.
+sys.stdout.reconfigure(line_buffering=True)
 
 HOUR_US = 3600 * 1_000_000
 SNAPSHOT_HOURS = [3, 4, 6, 12, 24]

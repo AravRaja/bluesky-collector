@@ -180,7 +180,11 @@ def step2_late_engagement(conn, min_post_age_us, window_us):
 
 def step3_refresh_reply_quote(conn, min_post_age_us):
     """Refresh reply/quote counts for tracked root posts.
-    Posts are never deleted, so recount is always safe."""
+    Posts are never deleted, so recount is always safe.
+
+    All rows in post_stats correspond to root posts older than 2h (created by
+    step 1 or step 2 which filter by min_post_age_us), so we can update the
+    whole table without re-checking that filter — avoids a huge IN subquery."""
     rowid_max = conn.execute(
         "SELECT COALESCE(MAX(rowid), 0) FROM post_stats"
     ).fetchone()[0]
@@ -194,20 +198,23 @@ def step3_refresh_reply_quote(conn, min_post_age_us):
                  replies = COALESCE((SELECT COUNT(*) FROM posts WHERE reply_parent=post_stats.uri), 0),
                  quotes  = COALESCE((SELECT COUNT(*) FROM posts WHERE quote_of=post_stats.uri), 0),
                  updated_at = strftime('%Y-%m-%dT%H:%M:%S','now')
-               WHERE rowid BETWEEN ? AND ?
-                 AND uri IN (SELECT uri FROM posts
-                             WHERE time_us < ? AND reply_parent IS NULL AND quote_of IS NULL)""",
-            (current, current + BATCH_SIZE - 1, min_post_age_us),
+               WHERE rowid BETWEEN ? AND ?""",
+            (current, current + BATCH_SIZE - 1),
         )
         conn.commit()
         total += cur.rowcount
         current += BATCH_SIZE
+        if current // 50000 != (current - BATCH_SIZE) // 50000:
+            print(f"  step3: {current:,} / {rowid_max:,} rowids processed")
         time.sleep(SLEEP_SEC)
     return total
 
 
 def step4_snapshots(conn, now_us):
-    """Snapshot reposts at each horizon (3h/4h/6h/12h/24h). Each cell is written once."""
+    """Snapshot reposts at each horizon (3h/4h/6h/12h/24h). Each cell is written once.
+
+    Uses a correlated subquery on posts.uri (PK lookup) instead of an IN-list
+    so each batch is O(BATCH_SIZE) not O(millions)."""
     rowid_max = conn.execute(
         "SELECT COALESCE(MAX(rowid), 0) FROM post_stats"
     ).fetchone()[0]
@@ -218,21 +225,22 @@ def step4_snapshots(conn, now_us):
         col = f"reposts_{h}h"
         age_cutoff_us = now_us - (h * HOUR_US)
         current = 1
+        bucket_total = 0
         while current <= rowid_max:
             cur = conn.execute(
                 f"""UPDATE post_stats SET {col} = reposts,
                       updated_at = strftime('%Y-%m-%dT%H:%M:%S','now')
                     WHERE rowid BETWEEN ? AND ?
                       AND {col} IS NULL
-                      AND uri IN (SELECT uri FROM posts
-                                  WHERE time_us < ?
-                                    AND reply_parent IS NULL AND quote_of IS NULL)""",
+                      AND (SELECT time_us FROM posts WHERE uri=post_stats.uri) < ?""",
                 (current, current + BATCH_SIZE - 1, age_cutoff_us),
             )
             conn.commit()
-            total += cur.rowcount
+            bucket_total += cur.rowcount
             current += BATCH_SIZE
             time.sleep(SLEEP_SEC)
+        total += bucket_total
+        print(f"  step4: {h}h bucket — {bucket_total:,} snapshots written")
     return total
 
 

@@ -99,55 +99,81 @@ def step1_initial_aggregation(conn, min_post_age_us, window_us):
 
 
 def step2_late_engagement(conn, min_post_age_us, window_us):
-    """Aggregate late (post-cascade) engagement into post_stats, then delete those rows."""
+    """Aggregate late (post-cascade) engagement into post_stats, then delete those rows.
+
+    Iterates root posts in time_us order. For each batch of posts, uses the
+    indexed (type, subject_uri) lookup on engagements to find late rows —
+    avoids the expensive cross-table scan of the previous design."""
     total = 0
-    while True:
-        rows = conn.execute(
-            """SELECT e.rowid, e.subject_uri, e.type FROM engagements e
-               JOIN posts p ON e.subject_uri = p.uri
-               WHERE p.time_us < ? AND e.time_us > p.time_us + ?
+    current = 0
+    scanned_posts = 0
+    while current < min_post_age_us:
+        posts = conn.execute(
+            """SELECT uri, time_us FROM posts
+               WHERE reply_parent IS NULL AND quote_of IS NULL
+                 AND time_us >= ? AND time_us < ?
+               ORDER BY time_us
                LIMIT ?""",
-            (min_post_age_us, window_us, BATCH_SIZE),
+            (current, min_post_age_us, BATCH_SIZE),
         ).fetchall()
-        if not rows:
+        if not posts:
             break
 
-        counts = {}
-        rowids = []
-        for rowid, uri, etype in rows:
-            counts[(uri, etype)] = counts.get((uri, etype), 0) + 1
-            rowids.append(rowid)
+        like_updates = []
+        repost_updates = []
+        delete_keys = []  # (subject_uri, late_cutoff) — used in DELETE WHERE subject_uri=? AND time_us>?
 
-        like_rows = [(uri, n) for (uri, t), n in counts.items() if t == "like"]
-        repost_rows = [(uri, n) for (uri, t), n in counts.items() if t == "repost"]
+        for uri, post_time in posts:
+            late_cutoff = post_time + window_us
+            row = conn.execute(
+                """SELECT
+                     SUM(CASE WHEN type='like' THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN type='repost' THEN 1 ELSE 0 END)
+                   FROM engagements WHERE subject_uri=? AND time_us>?""",
+                (uri, late_cutoff),
+            ).fetchone()
+            likes = row[0] or 0
+            reposts = row[1] or 0
+            if likes:
+                like_updates.append((uri, likes))
+            if reposts:
+                repost_updates.append((uri, reposts))
+            if likes or reposts:
+                delete_keys.append((uri, late_cutoff))
 
-        if like_rows:
+        if like_updates:
             conn.executemany(
                 """INSERT INTO post_stats (uri, likes, reposts, replies, quotes)
                    VALUES (?, ?, 0, 0, 0)
                    ON CONFLICT(uri) DO UPDATE SET
                      likes = likes + excluded.likes,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%S','now')""",
-                like_rows,
+                like_updates,
             )
-        if repost_rows:
+        if repost_updates:
             conn.executemany(
                 """INSERT INTO post_stats (uri, likes, reposts, replies, quotes)
                    VALUES (?, 0, ?, 0, 0)
                    ON CONFLICT(uri) DO UPDATE SET
                      reposts = reposts + excluded.reposts,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%S','now')""",
-                repost_rows,
+                repost_updates,
             )
+        if delete_keys:
+            batch_total = sum(l for _, l in like_updates) + sum(r for _, r in repost_updates)
+            conn.executemany(
+                "DELETE FROM engagements WHERE subject_uri=? AND time_us>?",
+                delete_keys,
+            )
+            total += batch_total
+            if total // 10000 != (total - batch_total) // 10000:
+                print(f"  step2: {total:,} late engagement rows processed...")
 
-        placeholders = ",".join("?" * len(rowids))
-        conn.execute(
-            f"DELETE FROM engagements WHERE rowid IN ({placeholders})", rowids
-        )
         conn.commit()
-        total += len(rowids)
-        if total // 10000 != (total - len(rowids)) // 10000:
-            print(f"  step2: {total:,} late engagement rows processed...")
+        scanned_posts += len(posts)
+        if scanned_posts // 100000 != (scanned_posts - len(posts)) // 100000:
+            print(f"  step2: scanned {scanned_posts:,} posts, processed {total:,} late rows")
+        current = posts[-1][1] + 1
         time.sleep(SLEEP_SEC)
     return total
 

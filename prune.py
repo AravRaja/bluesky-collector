@@ -30,11 +30,24 @@ def step1_initial_aggregation(conn, min_post_age_us, window_us):
     """Create post_stats rows for root posts older than the cascade window
     that aren't tracked yet. Counts engagement inside the 2h cascade window.
 
-    Iterates posts in time_us order using a cursor — each batch scans at most
-    BATCH_SIZE rows via idx_posts_root_time, not the whole table."""
+    Iterates posts in time_us order — each batch scans at most BATCH_SIZE rows
+    via idx_posts_root_time. Finds missing rows by starting from the oldest
+    untracked root post and paginating from there, so we don't waste time
+    re-scanning posts that already have post_stats."""
     total = 0
-    scanned = 0
-    current = 0
+    # Find the oldest root post that's older than 2h and lacks a post_stats row.
+    # If none, step 1 has no work.
+    row = conn.execute(
+        """SELECT MIN(p.time_us) FROM posts p
+           WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
+             AND p.time_us < ?
+             AND NOT EXISTS (SELECT 1 FROM post_stats ps WHERE ps.uri = p.uri)""",
+        (min_post_age_us,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return 0
+
+    current = row[0]
     while current < min_post_age_us:
         rows = conn.execute(
             """SELECT p.uri, p.time_us FROM posts p
@@ -77,10 +90,8 @@ def step1_initial_aggregation(conn, min_post_age_us, window_us):
             )
             conn.commit()
             total += len(new_uris)
-
-        scanned += len(rows)
-        if scanned // 50000 != (scanned - len(rows)) // 50000:
-            print(f"  step1: scanned {scanned:,} posts, inserted {total:,}...")
+            if total // 1000 != (total - len(new_uris)) // 1000:
+                print(f"  step1: inserted {total:,}...")
 
         current = rows[-1][1] + 1
         time.sleep(SLEEP_SEC)

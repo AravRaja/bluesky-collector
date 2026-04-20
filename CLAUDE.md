@@ -78,6 +78,10 @@ Runs hourly via `prune.timer`. For each root post older than 2 hours:
 5. Delete engagement rows outside cascade window
 6. Delete follows older than 7 days
 
+**Prune is incremental** — each step commits in batches of `BATCH_SIZE` (500) rows with a `SLEEP_SEC` (0.1s) yield between commits. The collector interleaves its ~50ms flushes in those gaps, so the write lock is never held long enough to starve it. Steps 1 and 2 iterate root posts in `time_us` order using a cursor, so each batch is bounded by an index scan — no O(n²) behavior on large DBs. Tune `BATCH_SIZE` and `SLEEP_SEC` at the top of `prune.py` if needed.
+
+**Why this design** — the pre-incremental version held a single 20+ minute write transaction per run. Once prune started taking longer than the hourly trigger interval, back-to-back runs left the collector with zero write access for hours, the cursor fell 36h behind real-time, and we nearly hit the 72h Jetstream retention limit. Incremental commits fix this at the cost of prune itself running slightly longer wall-clock.
+
 ## Key design notes
 
 - **Dashboard has ZERO database connections** — reads `/data/dashboard_stats.json` only
@@ -95,6 +99,20 @@ Things to verify:
 - `stat /data/dashboard_stats.json` — modified within last 2 minutes
 - `df -h /data` — disk usage reasonable
 - `sudo journalctl -u collector -n 5 --no-pager` — no crash loops
+- **Cursor lag** — the firehose cursor should be within seconds of real time. If lag grows into hours, prune is probably starving the collector (see below). Compute with:
+  ```bash
+  python3 -c "import datetime as dt; c=int(open('/home/ubuntu/.cursor').read()); print(f'lag: {(dt.datetime.utcnow().timestamp()*1e6-c)/3.6e9:.2f}h')"
+  ```
+
+## Troubleshooting: collector falling behind
+
+Symptom: dashboard shows old data, cursor lag > 1h, `journalctl -u collector` shows repeated `[flush] error: database is locked`.
+
+Typical cause: prune is hogging the write lock. Check:
+- `ps auxf | grep prune.py` — is a prune process running?
+- `sudo journalctl -u prune.service --since "6 hours ago" | grep -E "Starting|Finished"` — are prune runs overlapping or finishing within the hour?
+
+Fix: `sudo systemctl stop prune.timer && sudo kill <prune-pid>` to unblock the collector, then diagnose why prune is slow (usually the engagements or post_stats table grew past expectations).
 
 ## Export
 

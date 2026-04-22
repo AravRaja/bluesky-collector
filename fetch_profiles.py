@@ -20,7 +20,8 @@ import requests
 
 import db
 
-API_BASE = "https://bsky.social/xrpc"
+API_BASE = "https://public.api.bsky.app/xrpc"
+AUTH_API_BASE = "https://bsky.social/xrpc"
 BATCH_SIZE = 25  # max DIDs per getProfiles call
 RATE_LIMIT_DELAY = 0.2  # seconds between requests (unauthenticated safe default)
 
@@ -28,7 +29,7 @@ RATE_LIMIT_DELAY = 0.2  # seconds between requests (unauthenticated safe default
 def authenticate(handle, app_password):
     """Create an authenticated session, return access token."""
     resp = requests.post(
-        f"{API_BASE}/com.atproto.server.createSession",
+        f"{AUTH_API_BASE}/com.atproto.server.createSession",
         json={"identifier": handle, "password": app_password},
     )
     resp.raise_for_status()
@@ -37,12 +38,13 @@ def authenticate(handle, app_password):
 
 def fetch_profiles_batch(dids, token=None):
     """Fetch up to 25 profiles in one API call."""
+    base = AUTH_API_BASE if token else API_BASE
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     params = [("actors", did) for did in dids]
     resp = requests.get(
-        f"{API_BASE}/app.bsky.actor.getProfiles",
+        f"{base}/app.bsky.actor.getProfiles",
         params=params,
         headers=headers,
     )

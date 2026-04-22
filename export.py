@@ -15,6 +15,8 @@ Usage:
 """
 
 import argparse
+import hashlib
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,8 +25,27 @@ import pandas as pd
 import db
 from virality_threshold import is_viral as _is_viral_fn
 
-# Repost threshold for "viral" — must match virality_threshold.py
 VIRAL_REPOST_THRESHOLD = 100
+SALT_PATH = Path.home() / ".export_salt"
+
+
+def load_or_create_salt():
+    if SALT_PATH.exists():
+        return SALT_PATH.read_text().strip()
+    salt = secrets.token_hex(16)
+    SALT_PATH.write_text(salt)
+    SALT_PATH.chmod(0o600)
+    print(f"Generated DID salt, saved to {SALT_PATH}")
+    return salt
+
+
+def hash_did_series(series, salt):
+    salt_b = salt.encode()
+    def h(d):
+        if not isinstance(d, str):
+            return d
+        return hashlib.sha256(salt_b + d.encode()).hexdigest()[:16]
+    return series.map(h)
 
 
 def ts_to_time_us(ts_str):
@@ -48,6 +69,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
                 cascade_window_min, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     window_sec = cascade_window_min * 60
+    salt = load_or_create_salt()
 
     # -------------------------------------------------------------------
     # Step 1: Viral posts — from post_stats (pruned) + live engagement (recent)
@@ -220,6 +242,8 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     # Step 5: Export Layer 1
     # -------------------------------------------------------------------
     print("Exporting Layer 1: root_posts.parquet")
+    layer1["did"] = hash_did_series(layer1["did"], salt)
+    layer1 = layer1.drop(columns=["author_handle"], errors="ignore")
     layer1.to_parquet(out_dir / "root_posts.parquet", index=False)
 
     # -------------------------------------------------------------------
@@ -242,6 +266,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     )
     reposts_df = _add_time_delta(reposts_df, "repost_time_us", l1_time)
     reposts_df = reposts_df[reposts_df["time_delta_sec"].between(0, window_sec)]
+    reposts_df["reposter_did"] = hash_did_series(reposts_df["reposter_did"], salt)
     reposts_df.to_parquet(out_dir / "reposts.parquet", index=False)
 
     print(f"Exporting Layer 2: likes.parquet    (first {cascade_window_min} min)")
@@ -255,6 +280,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     )
     likes_df = _add_time_delta(likes_df, "like_time_us", l1_time)
     likes_df = likes_df[likes_df["time_delta_sec"].between(0, window_sec)]
+    likes_df["liker_did"] = hash_did_series(likes_df["liker_did"], salt)
     likes_df.to_parquet(out_dir / "likes.parquet", index=False)
 
     print(f"Exporting Layer 2: replies.parquet  (first {cascade_window_min} min)")
@@ -272,6 +298,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     )
     replies_df = _add_time_delta(replies_df, "reply_time_us", l1_time)
     replies_df = replies_df[replies_df["time_delta_sec"].between(0, window_sec)]
+    replies_df["replier_did"] = hash_did_series(replies_df["replier_did"], salt)
     replies_df.to_parquet(out_dir / "replies.parquet", index=False)
 
     print(f"Exporting Layer 2: quotes.parquet   (first {cascade_window_min} min)")
@@ -289,6 +316,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     )
     quotes_df = _add_time_delta(quotes_df, "quote_time_us", l1_time)
     quotes_df = quotes_df[quotes_df["time_delta_sec"].between(0, window_sec)]
+    quotes_df["quoter_did"] = hash_did_series(quotes_df["quoter_did"], salt)
     quotes_df.to_parquet(out_dir / "quotes.parquet", index=False)
 
     conn.execute("DROP TABLE IF EXISTS _export_uris")

@@ -22,8 +22,8 @@ import db
 
 API_BASE = "https://public.api.bsky.app/xrpc"
 AUTH_API_BASE = "https://bsky.social/xrpc"
-BATCH_SIZE = 25  # max DIDs per getProfiles call
-RATE_LIMIT_DELAY = 0.2  # seconds between requests (unauthenticated safe default)
+BATCH_SIZE = 25
+RATE_LIMIT_DELAY = 0.2
 
 
 def authenticate(handle, app_password):
@@ -36,18 +36,35 @@ def authenticate(handle, app_password):
     return resp.json()["accessJwt"]
 
 
-def fetch_profiles_batch(dids, token=None):
-    """Fetch up to 25 profiles in one API call."""
+def _fetch_single_batch(dids, token):
     base = AUTH_API_BASE if token else API_BASE
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     params = [("actors", did) for did in dids]
     resp = requests.get(
         f"{base}/app.bsky.actor.getProfiles",
         params=params,
         headers=headers,
     )
+    return resp
+
+
+def fetch_profiles_batch(dids, token=None):
+    """Fetch profiles. On 400, split the batch to isolate bad DIDs and recover the good ones."""
+    if not dids:
+        return []
+    resp = _fetch_single_batch(dids, token)
+
+    if resp.status_code == 400 and len(dids) > 1:
+        mid = len(dids) // 2
+        time.sleep(0.02)
+        left = fetch_profiles_batch(dids[:mid], token)
+        time.sleep(0.02)
+        right = fetch_profiles_batch(dids[mid:], token)
+        return left + right
+
+    if resp.status_code == 400:
+        return []
+
     resp.raise_for_status()
     profiles = resp.json().get("profiles", [])
     return [

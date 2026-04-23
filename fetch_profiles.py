@@ -44,6 +44,7 @@ def _fetch_single_batch(dids, token):
         f"{base}/app.bsky.actor.getProfiles",
         params=params,
         headers=headers,
+        timeout=(10, 30),
     )
     return resp
 

@@ -15,15 +15,21 @@ Usage:
 """
 
 import argparse
+import gc
 import hashlib
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 import db
 from virality_threshold import is_viral as _is_viral_fn
+
+
+CHUNK_SIZE = 200_000  # rows per chunk for streamed Layer 2 exports
 
 VIRAL_REPOST_THRESHOLD = 100
 SALT_PATH = Path.home() / ".export_salt"
@@ -63,6 +69,27 @@ def _add_time_delta(df, time_col, time_map, uri_col="root_post_uri"):
     df = df.copy()
     df["time_delta_sec"] = (df[time_col] - df[uri_col].map(time_map)) / 1e6
     return df
+
+
+def _stream_layer2(conn, sql, out_path, time_col, time_map, window_sec, salt, hash_col):
+    """Stream a Layer 2 query to parquet in chunks — keeps memory bounded on large tables."""
+    writer = None
+    total = 0
+    for chunk in pd.read_sql_query(sql, conn, chunksize=CHUNK_SIZE):
+        chunk = _add_time_delta(chunk, time_col, time_map)
+        chunk = chunk[chunk["time_delta_sec"].between(0, window_sec)]
+        if chunk.empty:
+            continue
+        if hash_col:
+            chunk[hash_col] = hash_did_series(chunk[hash_col], salt)
+        table = pa.Table.from_pandas(chunk, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, table.schema)
+        writer.write_table(table)
+        total += len(chunk)
+    if writer is not None:
+        writer.close()
+    return total
 
 
 def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
@@ -154,8 +181,12 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     if not no_viral_label:
         viral_posts["is_viral"] = True
         non_viral_posts["is_viral"] = False
+    n_viral = len(viral_posts)
+    n_non_viral = len(non_viral_posts)
     layer1 = pd.concat([viral_posts, non_viral_posts], ignore_index=True)
-    print(f"  Layer 1: {len(viral_posts)} viral + {len(non_viral_posts)} non-viral = {len(layer1)} posts")
+    del viral_posts, non_viral_posts
+    gc.collect()
+    print(f"  Layer 1: {n_viral} viral + {n_non_viral} non-viral = {len(layer1)} posts")
 
     # -------------------------------------------------------------------
     # Step 3: Engagement totals — post_stats for old posts, live count for new
@@ -256,16 +287,20 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     print("Exporting Layer 1: root_posts.parquet")
     layer1["did"] = hash_did_series(layer1["did"], salt)
     layer1 = layer1.drop(columns=["author_handle"], errors="ignore")
+    l1_time = dict(zip(layer1["uri"], layer1["time_us"]))
+    layer1_rows = len(layer1)
     layer1.to_parquet(out_dir / "root_posts.parquet", index=False)
+    del layer1
+    gc.collect()
 
     # -------------------------------------------------------------------
-    # Step 6: Layer 2 cascade — temp table already has the right URIs
+    # Step 6: Layer 2 cascade — streamed in chunks to keep memory bounded
     # -------------------------------------------------------------------
-    l1_time   = dict(zip(layer1["uri"], layer1["time_us"]))
     window_us = cascade_window_min * 60 * 1_000_000
 
     print(f"Exporting Layer 2: reposts.parquet  (first {cascade_window_min} min)")
-    reposts_df = pd.read_sql_query(
+    reposts_rows = _stream_layer2(
+        conn,
         """SELECT e.subject_uri as root_post_uri, e.did as reposter_did,
                   e.time_us as repost_time_us, e.created_at,
                   p.followers_count as reposter_followers,
@@ -274,29 +309,25 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
            JOIN _export_uris x ON e.subject_uri = x.uri
            LEFT JOIN profiles p ON e.did = p.did
            WHERE e.type='repost'""",
-        conn,
+        out_dir / "reposts.parquet",
+        "repost_time_us", l1_time, window_sec, salt, "reposter_did",
     )
-    reposts_df = _add_time_delta(reposts_df, "repost_time_us", l1_time)
-    reposts_df = reposts_df[reposts_df["time_delta_sec"].between(0, window_sec)]
-    reposts_df["reposter_did"] = hash_did_series(reposts_df["reposter_did"], salt)
-    reposts_df.to_parquet(out_dir / "reposts.parquet", index=False)
 
     print(f"Exporting Layer 2: likes.parquet    (first {cascade_window_min} min)")
-    likes_df = pd.read_sql_query(
+    likes_rows = _stream_layer2(
+        conn,
         """SELECT e.subject_uri as root_post_uri, e.did as liker_did,
                   e.time_us as like_time_us, e.created_at
            FROM engagements e
            JOIN _export_uris x ON e.subject_uri = x.uri
            WHERE e.type='like'""",
-        conn,
+        out_dir / "likes.parquet",
+        "like_time_us", l1_time, window_sec, salt, "liker_did",
     )
-    likes_df = _add_time_delta(likes_df, "like_time_us", l1_time)
-    likes_df = likes_df[likes_df["time_delta_sec"].between(0, window_sec)]
-    likes_df["liker_did"] = hash_did_series(likes_df["liker_did"], salt)
-    likes_df.to_parquet(out_dir / "likes.parquet", index=False)
 
     print(f"Exporting Layer 2: replies.parquet  (first {cascade_window_min} min)")
-    replies_df = pd.read_sql_query(
+    replies_rows = _stream_layer2(
+        conn,
         """SELECT p.reply_root as root_post_uri, p.uri as reply_uri,
                   p.did as replier_did, p.time_us as reply_time_us,
                   p.text as reply_text, p.has_embed as reply_has_embed,
@@ -306,15 +337,13 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
            FROM posts p
            JOIN _export_uris x ON p.reply_root = x.uri
            LEFT JOIN profiles pr ON p.did = pr.did""",
-        conn,
+        out_dir / "replies.parquet",
+        "reply_time_us", l1_time, window_sec, salt, "replier_did",
     )
-    replies_df = _add_time_delta(replies_df, "reply_time_us", l1_time)
-    replies_df = replies_df[replies_df["time_delta_sec"].between(0, window_sec)]
-    replies_df["replier_did"] = hash_did_series(replies_df["replier_did"], salt)
-    replies_df.to_parquet(out_dir / "replies.parquet", index=False)
 
     print(f"Exporting Layer 2: quotes.parquet   (first {cascade_window_min} min)")
-    quotes_df = pd.read_sql_query(
+    quotes_rows = _stream_layer2(
+        conn,
         """SELECT p.quote_of as root_post_uri, p.uri as quote_uri,
                   p.did as quoter_did, p.time_us as quote_time_us,
                   p.text as quote_text, p.has_embed as quote_has_embed,
@@ -324,21 +353,18 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
            FROM posts p
            JOIN _export_uris x ON p.quote_of = x.uri
            LEFT JOIN profiles pr ON p.did = pr.did""",
-        conn,
+        out_dir / "quotes.parquet",
+        "quote_time_us", l1_time, window_sec, salt, "quoter_did",
     )
-    quotes_df = _add_time_delta(quotes_df, "quote_time_us", l1_time)
-    quotes_df = quotes_df[quotes_df["time_delta_sec"].between(0, window_sec)]
-    quotes_df["quoter_did"] = hash_did_series(quotes_df["quoter_did"], salt)
-    quotes_df.to_parquet(out_dir / "quotes.parquet", index=False)
 
     conn.execute("DROP TABLE IF EXISTS _export_uris")
 
     print(f"\nExport complete → {out_dir}/")
-    print(f"  root_posts.parquet : {len(layer1):>6} rows")
-    print(f"  reposts.parquet    : {len(reposts_df):>6} rows  (≤{cascade_window_min} min)")
-    print(f"  likes.parquet      : {len(likes_df):>6} rows  (≤{cascade_window_min} min)")
-    print(f"  replies.parquet    : {len(replies_df):>6} rows  (≤{cascade_window_min} min)")
-    print(f"  quotes.parquet     : {len(quotes_df):>6} rows  (≤{cascade_window_min} min)")
+    print(f"  root_posts.parquet : {layer1_rows:>6} rows")
+    print(f"  reposts.parquet    : {reposts_rows:>6} rows  (≤{cascade_window_min} min)")
+    print(f"  likes.parquet      : {likes_rows:>6} rows  (≤{cascade_window_min} min)")
+    print(f"  replies.parquet    : {replies_rows:>6} rows  (≤{cascade_window_min} min)")
+    print(f"  quotes.parquet     : {quotes_rows:>6} rows  (≤{cascade_window_min} min)")
 
 
 def main():

@@ -66,30 +66,32 @@ def _add_time_delta(df, time_col, time_map, uri_col="root_post_uri"):
 
 
 def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
-                cascade_window_min, out_dir):
+                cascade_window_min, out_dir, no_sample=False, no_viral_label=False):
     out_dir.mkdir(parents=True, exist_ok=True)
     window_sec = cascade_window_min * 60
     salt = load_or_create_salt()
+
+    # Only export posts whose author has a cached profile row.
+    profile_filter = "AND EXISTS (SELECT 1 FROM profiles pr WHERE pr.did = p.did)"
 
     # -------------------------------------------------------------------
     # Step 1: Viral posts — from post_stats (pruned) + live engagement (recent)
     # -------------------------------------------------------------------
     print("Finding viral posts...")
-    # Old posts: totals in post_stats
     viral_from_stats = pd.read_sql_query(
-        """SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
+        f"""SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
                   p.has_embed, p.embed_type, ps.reposts as total_reposts
            FROM post_stats ps
            JOIN posts p ON ps.uri = p.uri
            WHERE ps.reposts >= ?
              AND p.reply_parent IS NULL AND p.quote_of IS NULL
-             AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?""",
+             AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?
+             {profile_filter}""",
         conn,
         params=(VIRAL_REPOST_THRESHOLD, since_us, until_us, min_age_us),
     )
-    # Recent posts: engagement still in live rows
     viral_from_live = pd.read_sql_query(
-        """SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
+        f"""SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
                   p.has_embed, p.embed_type, COUNT(*) as total_reposts
            FROM engagements e
            JOIN posts p ON e.subject_uri = p.uri
@@ -97,6 +99,7 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
              AND p.reply_parent IS NULL AND p.quote_of IS NULL
              AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?
              AND p.uri NOT IN (SELECT uri FROM post_stats)
+             {profile_filter}
            GROUP BY e.subject_uri
            HAVING COUNT(*) >= ?""",
         conn,
@@ -107,41 +110,50 @@ def export_data(conn, since_us, until_us, min_age_us, sample_ratio,
     print(f"  Found {len(viral_posts)} viral posts")
 
     # -------------------------------------------------------------------
-    # Step 2: Sample non-viral posts — most recent N, uses idx_posts_root_time
+    # Step 2: Non-viral posts (sampled by default; --no-sample pulls all)
     # -------------------------------------------------------------------
-    n_sample = len(viral_posts) * sample_ratio
-    print(f"Sampling {n_sample} non-viral posts (most recent)...")
-
     viral_uris = viral_posts["uri"].tolist()
+    exclude_clause = ""
+    exclude_params = ()
     if viral_uris:
-        # Exclude viral URIs (small list, fine as IN clause)
         ph = ",".join("?" * len(viral_uris))
+        exclude_clause = f"AND p.uri NOT IN ({ph})"
+        exclude_params = tuple(viral_uris)
+
+    if no_sample:
+        print("Fetching ALL non-viral posts with cached profiles (no sampling)...")
         non_viral_posts = pd.read_sql_query(
-            f"""SELECT uri, did, time_us, created_at, text, langs, has_embed, embed_type
-                FROM posts
-                WHERE reply_parent IS NULL AND quote_of IS NULL
-                  AND time_us >= ? AND time_us <= ? AND time_us <= ?
-                  AND uri NOT IN ({ph})
-                ORDER BY time_us DESC
-                LIMIT ?""",
+            f"""SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
+                       p.has_embed, p.embed_type
+                FROM posts p
+                WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
+                  AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?
+                  {exclude_clause}
+                  {profile_filter}""",
             conn,
-            params=(since_us, until_us, min_age_us, *viral_uris, n_sample),
+            params=(since_us, until_us, min_age_us, *exclude_params),
         )
     else:
+        n_sample = len(viral_posts) * sample_ratio
+        print(f"Sampling {n_sample} non-viral posts (most recent)...")
         non_viral_posts = pd.read_sql_query(
-            """SELECT uri, did, time_us, created_at, text, langs, has_embed, embed_type
-               FROM posts
-               WHERE reply_parent IS NULL AND quote_of IS NULL
-                 AND time_us >= ? AND time_us <= ? AND time_us <= ?
-               ORDER BY time_us DESC
-               LIMIT ?""",
+            f"""SELECT p.uri, p.did, p.time_us, p.created_at, p.text, p.langs,
+                       p.has_embed, p.embed_type
+                FROM posts p
+                WHERE p.reply_parent IS NULL AND p.quote_of IS NULL
+                  AND p.time_us >= ? AND p.time_us <= ? AND p.time_us <= ?
+                  {exclude_clause}
+                  {profile_filter}
+                ORDER BY p.time_us DESC
+                LIMIT ?""",
             conn,
-            params=(since_us, until_us, min_age_us, n_sample),
+            params=(since_us, until_us, min_age_us, *exclude_params, n_sample),
         )
 
-    viral_posts["is_viral"] = True
-    non_viral_posts["is_viral"] = False
     non_viral_posts["total_reposts"] = 0
+    if not no_viral_label:
+        viral_posts["is_viral"] = True
+        non_viral_posts["is_viral"] = False
     layer1 = pd.concat([viral_posts, non_viral_posts], ignore_index=True)
     print(f"  Layer 1: {len(viral_posts)} viral + {len(non_viral_posts)} non-viral = {len(layer1)} posts")
 
@@ -341,6 +353,10 @@ def main():
                         help="Only cascade events within this many minutes of post creation")
     parser.add_argument("--out-dir",            type=str, default="./export")
     parser.add_argument("--db",                 type=str, default=None)
+    parser.add_argument("--no-sample",          action="store_true",
+                        help="Skip non-viral sampling — include every post with a cached profile")
+    parser.add_argument("--no-viral-label",     action="store_true",
+                        help="Drop the is_viral column (derivable from total_reposts)")
     args = parser.parse_args()
 
     db_path    = Path(args.db) if args.db else db.DEFAULT_DB_PATH
@@ -351,7 +367,8 @@ def main():
     min_age_us = now_us - (args.min_age_hours * 3600 * 1_000_000)
 
     export_data(conn, since_us, until_us, min_age_us,
-                args.sample_ratio, args.cascade_window_min, Path(args.out_dir))
+                args.sample_ratio, args.cascade_window_min, Path(args.out_dir),
+                no_sample=args.no_sample, no_viral_label=args.no_viral_label)
     conn.close()
 
 
